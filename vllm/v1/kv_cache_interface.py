@@ -100,6 +100,20 @@ class KVCacheSpec:
     def storage_block_size(self) -> int:
         return self.block_size
 
+    @property
+    def aggregated_layer_count(self) -> int:
+        """Number of model layers stored inside one instance of this spec.
+
+        Default 1 (legacy per-layer storage: each layer has its own
+        independent spec instance and KV tensor). Composite/shared
+        layouts that fuse multiple layers into one shared KVCacheTensor
+        (whose ``page_size_bytes`` already SUMS per-layer slot bytes
+        across those layers) return the merged count, so budget code
+        does not double-count by also multiplying by the group's
+        ``len(layer_names)``.
+        """
+        return 1
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         """
         The maximum possible memory usage of this KV cache in bytes.
@@ -755,6 +769,25 @@ class KVCacheGroupSpec:
     kv_cache_spec: KVCacheSpec
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
+
+    @property
+    def num_spec_instances(self) -> int:
+        """Number of independent spec instances backing this group's layers.
+
+        Legacy per-layer storage: equals ``len(layer_names)`` (one spec
+        instance per layer). Composite/shared layouts: the group is
+        backed by one shared spec whose ``page_size_bytes`` already
+        aggregates ``aggregated_layer_count`` layers, so the effective
+        instance count is ``len(layer_names) //
+        spec.aggregated_layer_count``. Budget math multiplies by this
+        instead of raw ``len(layer_names)`` to avoid double-counting.
+        """
+        n = self.kv_cache_spec.aggregated_layer_count
+        assert len(self.layer_names) % n == 0, (
+            f"Group has {len(self.layer_names)} layers but spec aggregates "
+            f"{n} per instance (not divisible)."
+        )
+        return len(self.layer_names) // n
 
 
 @dataclass

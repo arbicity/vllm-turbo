@@ -916,8 +916,11 @@ def get_max_concurrency_for_kv_cache_config(
         assert max_concurrency is not None
         return max_concurrency
 
+    # ``num_spec_instances`` (not raw ``len(layer_names)``) so composite
+    # specs aren't double-counted — their page_size already aggregates
+    # ``aggregated_layer_count`` layers.
     num_layer_per_group = max(
-        len(group.layer_names) for group in kv_cache_config.kv_cache_groups
+        group.num_spec_instances for group in kv_cache_config.kv_cache_groups
     )
     max_memory_usage_per_request = num_layer_per_group * max_memory_usage_bytes(
         vllm_config, (group.kv_cache_spec for group in kv_cache_config.kv_cache_groups)
@@ -963,7 +966,10 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
             for g in kv_cache_groups
         )
         return layer_tuple_page_bytes * num_layer_tuples
-    group_size = max(len(g.layer_names) for g in kv_cache_groups)
+    # ``num_spec_instances`` (not raw ``len(layer_names)``) so composite
+    # specs — whose page_size already aggregates ``aggregated_layer_count``
+    # layers — are not multiplied again.
+    group_size = max(g.num_spec_instances for g in kv_cache_groups)
     page_size = get_uniform_page_size([g.kv_cache_spec for g in kv_cache_groups])
     return page_size * group_size
 
@@ -2066,7 +2072,17 @@ def _max_memory_usage_bytes_from_groups(
     # General case: sum max memory across all groups.
     # For uniform-page hybrids: group_size * page_size * blocks_needed.
     # For split hybrids (O(1) mamba + O(n) attention): sum per-group.
-    group_size = max(len(group.layer_names) for group in kv_cache_groups)
+    #
+    # We multiply by the number of INDEPENDENT spec instances in the
+    # group (``num_spec_instances``), not by raw ``len(layer_names)``.
+    # For legacy per-layer storage the two are equal. For composite
+    # layouts that fuse N layers into one shared KVCacheTensor whose
+    # ``page_size_bytes`` already sums per-layer slot bytes, the
+    # effective instance count is ``len(layer_names) //
+    # aggregated_layer_count`` — multiplying by raw ``len(layer_names)``
+    # would double-count by exactly the aggregated layer count
+    # (historical 36× overcount on Qwen3-4B composite-spec).
+    group_size = max(g.num_spec_instances for g in kv_cache_groups)
     page_sizes = set(g.kv_cache_spec.page_size_bytes for g in kv_cache_groups)
     if len(page_sizes) == 1:
         page_size = page_sizes.pop()
@@ -2078,7 +2094,7 @@ def _max_memory_usage_bytes_from_groups(
     else:
         # Non-uniform pages: sum each group's max usage independently
         return sum(
-            len(g.layer_names)
+            g.num_spec_instances
             * g.kv_cache_spec.max_memory_usage_bytes(vllm_config)
             for g in kv_cache_groups
         )
