@@ -2022,11 +2022,12 @@ class EngineArgs:
             )
 
         # Plugin-registered KV cache dtypes (e.g. tqkv) ship with their own
-        # AttentionBackend bound to AttentionBackendEnum.CUSTOM via
-        # register_backend(). When the user selects such a dtype but doesn't
-        # pass --attention-backend, default to CUSTOM so the second flag is
-        # redundant. An explicit user choice (either via --attention-backend
-        # or --attention-config.backend) is honoured untouched.
+        # AttentionBackend registered under AttentionBackendEnum.TURBO_ATTN
+        # via register_backend(). When the user selects such a dtype but
+        # doesn't pass --attention-backend, default to TURBO_ATTN so the
+        # second flag is redundant. An explicit user choice (either via
+        # --attention-backend or --attention-config.backend) is honoured
+        # untouched.
         if (
             attention_config.backend is None
             and is_plugin_cache_dtype(resolved_cache_dtype)
@@ -2034,9 +2035,9 @@ class EngineArgs:
             from vllm.v1.attention.backends.registry import (
                 AttentionBackendEnum,
             )
-            attention_config.backend = AttentionBackendEnum.CUSTOM
+            attention_config.backend = AttentionBackendEnum.TURBO_ATTN
             logger.info(
-                "Auto-selecting attention backend CUSTOM for "
+                "Auto-selecting attention backend TURBO_ATTN for "
                 "plugin-registered kv-cache dtype %r. Pass "
                 "--attention-backend to override.",
                 resolved_cache_dtype,
