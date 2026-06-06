@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from importlib.util import find_spec
+from typing import Any, Callable
 
 import torch
 
@@ -119,6 +119,52 @@ direct_register_custom_op(
 )
 
 
+# Registry of optional fast-path implementations for ApplyRotaryEmb.
+# Each entry is (name, factory). The factory returns a callable matching
+# flash_attn.ops.triton.rotary.apply_rotary's signature, or raises
+# ImportError if its dependency is unavailable. The first factory that
+# returns successfully wins.
+#
+# This replaces feature-detect-by-package-name (find_spec) with
+# feature-detect-by-symbol-import. find_spec("flash_attn") was falsely
+# truthy under flash-attn 4 (which only ships flash_attn.cute as a
+# namespace package), which then raised ModuleNotFoundError on every
+# model construction when the subsequent .ops.triton.rotary import ran.
+_ROTARY_FAST_PATHS: list[tuple[str, Callable[[], Callable[..., Any]]]] = []
+
+
+def register_rotary_fast_path(
+    name: str,
+    factory: Callable[[], Callable[..., Any]],
+) -> None:
+    """Register a candidate fast-path implementation for ApplyRotaryEmb.
+
+    Implementations are tried in registration order; the first whose
+    factory returns successfully (i.e. its dependency imports cleanly)
+    is used. The returned callable must accept the same arguments as
+    flash_attn.ops.triton.rotary.apply_rotary.
+    """
+    _ROTARY_FAST_PATHS.append((name, factory))
+
+
+def _select_rotary_fast_path() -> tuple[str | None, Callable[..., Any] | None]:
+    for name, factory in _ROTARY_FAST_PATHS:
+        try:
+            return name, factory()
+        except ImportError:
+            continue
+    return None, None
+
+
+def _flash_attn_rotary_factory() -> Callable[..., Any]:
+    from flash_attn.ops.triton.rotary import apply_rotary
+    return apply_rotary
+
+
+# Built-in fast paths shipped with vLLM.
+register_rotary_fast_path("flash_attn", _flash_attn_rotary_factory)
+
+
 # --8<-- [start:apply_rotary_emb]
 @CustomOp.register("apply_rotary_emb")
 class ApplyRotaryEmb(CustomOp):
@@ -134,11 +180,9 @@ class ApplyRotaryEmb(CustomOp):
         self.is_neox_style = is_neox_style
         self.enable_fp32_compute = enable_fp32_compute
 
-        self.apply_rotary_emb_flash_attn = None
-        if not current_platform.is_cpu() and find_spec("flash_attn") is not None:
-            from flash_attn.ops.triton.rotary import apply_rotary
-
-            self.apply_rotary_emb_flash_attn = apply_rotary
+        self._rotary_fast_path_name, self.apply_rotary_emb_fast = (
+            _select_rotary_fast_path()
+        )
 
     @staticmethod
     def forward_static(
@@ -253,7 +297,7 @@ class ApplyRotaryEmb(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        if self.apply_rotary_emb_flash_attn is not None:
+        if self.apply_rotary_emb_fast is not None:
             x, cos, sin, origin_shape, origin_dtype = self._pre_process(x, cos, sin)
 
             """
@@ -264,7 +308,7 @@ class ApplyRotaryEmb(CustomOp):
                 ...
             """
             interleaved = not self.is_neox_style
-            output = self.apply_rotary_emb_flash_attn(
+            output = self.apply_rotary_emb_fast(
                 x, cos, sin, interleaved=interleaved
             ).type_as(x)
 

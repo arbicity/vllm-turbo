@@ -151,10 +151,11 @@ class KVBlockZeroer:
                 cur_page_el = kernel_block_el * ratio
                 if page_size_el is None:
                     page_size_el = cur_page_el
-                else:
-                    assert page_size_el == cur_page_el, (
-                        f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
-                    )
+                elif page_size_el != cur_page_el:
+                    # Per-layer bit allocation gives layers different KV buffer
+                    # sizes. Block zeroing requires uniform strides; disable it.
+                    self._meta = None
+                    return
 
                 block_stride_bytes = cur_bytes
                 outer_dims = [

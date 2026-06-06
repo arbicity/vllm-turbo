@@ -64,11 +64,10 @@ def get_attn_backend(
     """Selects which attention backend to use and lazily imports it."""
 
     if kv_cache_dtype is not None:
-        valid_cache_dtypes = get_args(CacheDType)
-        assert kv_cache_dtype in valid_cache_dtypes, (
-            f"Invalid kv_cache_dtype: {kv_cache_dtype}. "
-            f"Valid values are: {valid_cache_dtypes}"
-        )
+        from vllm.config.cache import validate_cache_dtype
+        # Raises ValueError with a clear message if the dtype isn't
+        # builtin or plugin-registered.
+        validate_cache_dtype(kv_cache_dtype)
 
     from vllm.config import get_current_vllm_config
 
@@ -110,16 +109,73 @@ def _cached_get_attn_backend(
 ) -> type[AttentionBackend]:
     from vllm.platforms import current_platform
 
-    attention_cls = current_platform.get_attn_backend_cls(
-        backend,
-        attn_selector_config=attn_selector_config,
-        num_heads=num_heads,
-    )
+    # MLA wrapping: when the user selected an attention backend that
+    # declares wraps_mla_backend (i.e. it isn't an MLA backend itself,
+    # but knows how to wrap one), we fall through to standard MLA
+    # candidate selection — ignoring the user's --attention-backend
+    # for the MLA layer's primary pick — and apply the wrapper after.
+    # The dtype gate is also lifted (kv_cache_dtype="auto") because the
+    # wrapper class is what supports the user's compressed dtype, not
+    # the picked base MLA backend.
+    user_selected_backend_cls = None
+    if backend is not None and attn_selector_config.use_mla:
+        try:
+            _maybe_user_cls = backend.get_class()
+        except (ValueError, ImportError):
+            _maybe_user_cls = None
+        if _maybe_user_cls is not None:
+            _user_wraps_fn = getattr(
+                _maybe_user_cls, "wraps_mla_backend", None,
+            )
+            _base_wraps_fn = getattr(AttentionBackend, "wraps_mla_backend", None)
+            # Only treat as wrapper-capable if the backend overrode the
+            # default no-op (avoids matching every backend).
+            if (
+                _user_wraps_fn is not None
+                and _base_wraps_fn is not None
+                and getattr(_user_wraps_fn, "__func__", _user_wraps_fn)
+                is not getattr(_base_wraps_fn, "__func__", _base_wraps_fn)
+            ):
+                user_selected_backend_cls = _maybe_user_cls
+
+    if user_selected_backend_cls is not None:
+        # Fall through to standard MLA selection without the user's
+        # backend constraint AND with dtype gate lifted (kv_cache_dtype=
+        # "auto"). The wrapper class will be applied below.
+        from typing import cast
+
+        relaxed_config = attn_selector_config._replace(
+            kv_cache_dtype=cast(CacheDType | None, "auto"),
+        )
+        attention_cls = current_platform.get_attn_backend_cls(
+            None,
+            attn_selector_config=relaxed_config,
+            num_heads=num_heads,
+        )
+    else:
+        attention_cls = current_platform.get_attn_backend_cls(
+            backend,
+            attn_selector_config=attn_selector_config,
+            num_heads=num_heads,
+        )
     if not attention_cls:
         raise ValueError(
             f"Invalid attention backend for {current_platform.device_name}"
         )
     backend = resolve_obj_by_qualname(attention_cls)
+
+    # Apply the MLA wrapper if applicable. Wrapper's
+    # supported_kv_cache_dtypes is what advertises the user's dtype;
+    # the base backend's spec/impl is wrapped to compress KV.
+    if user_selected_backend_cls is not None:
+        wrapper = user_selected_backend_cls.wraps_mla_backend(backend)
+        if wrapper is not None and wrapper is not backend:
+            logger.info(
+                "Wrapping MLA backend %s with %s.",
+                backend.__name__,
+                getattr(wrapper, "__name__", repr(wrapper)),
+            )
+            backend = wrapper
 
     # Adjust kv cache layout if the selected backend requires a specific one
     required_layout = backend.get_required_kv_cache_layout()
