@@ -596,6 +596,21 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        # Backend lifecycle hook: KV cache is allocated (initialize_kv_cache
+        # ran in initialize_from_config) but CUDA-graph capture has NOT
+        # started yet — the eager, pre-capture window a compressed-KV
+        # backend needs to warm any per-(k_bw,v_bw) decode autotune so a
+        # smart-mix bundle doesn't re-sweep lazily during capture. No-op
+        # for backends that don't define the hook.
+        try:
+            from vllm.v1.attention.backend import AttentionBackend
+
+            _backend_cls = AttentionBackend.resolve_user_selected_backend(self.vllm_config)
+            if _backend_cls is not None and hasattr(_backend_cls, "on_kv_cache_initialized"):
+                _backend_cls.on_kv_cache_initialized(self)
+        except Exception as _e:
+            logger.warning("on_kv_cache_initialized hook failed: %s", _e)
+
         warmup_sizes: list[int] = []
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
