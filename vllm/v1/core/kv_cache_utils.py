@@ -902,6 +902,26 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
+    # Per-group split pools (hybrid GDN/Mamba + attention): each group owns an
+    # INDEPENDENT BlockPool, so the shared-pool math below — which assumes one
+    # pool and cancels ``num_layer_per_group`` — does not apply and over-reports
+    # capacity by ~the full-attention layer count. Compute concurrency from the
+    # token-scaling (attention) pools directly: each request needs
+    # ``cdiv(max_model_len, block_size)`` blocks per such pool, while O(1)
+    # recurrent (Mamba) groups don't scale with context (they're bounded by
+    # max_mamba_cache_size, not the per-token KV budget). The effective KV-token
+    # capacity is set by the most-constrained token-scaling pool.
+    per_group_nb = getattr(kv_cache_config, "per_group_num_blocks", None)
+    if per_group_nb is not None:
+        max_model_len = vllm_config.model_config.max_model_len
+        token_scaling = [
+            nb / cdiv(max_model_len, group.kv_cache_spec.block_size)
+            for nb, group in zip(per_group_nb, kv_cache_config.kv_cache_groups)
+            if not isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        if token_scaling:
+            return min(token_scaling)
+
     num_layer_per_group = max(
         len(group.layer_names) for group in kv_cache_config.kv_cache_groups
     )
