@@ -1317,9 +1317,12 @@ def get_manager_for_kv_cache_spec(
     """
     Get the appropriate manager for a given KVCacheSpec.
 
-    Uses the KVCacheSpecRegistry to look up the manager class, supporting
-    both built-in and custom specs registered via @register_kv_cache_spec
-    and KVCacheSpecRegistry.register.
+    Spec-declared manager (the per-spec ``get_manager_class()`` override) takes
+    precedence: plugin specs (e.g. tqkv/compressed-KV) declare their own
+    manager without mutating any global map. If the spec does not override it,
+    fall through to the v0.23.0 KVCacheSpecRegistry (which replaced the old
+    module-level ``spec_manager_map``), supporting both built-in and custom
+    specs registered via @register_kv_cache_spec.
 
     Args:
         kv_cache_spec: The KVCacheSpec instance
@@ -1328,7 +1331,10 @@ def get_manager_for_kv_cache_spec(
     Returns:
         An instance of the appropriate SingleTypeKVCacheManager subclass
     """
-    manager_class = KVCacheSpecRegistry.get_manager_class(kv_cache_spec)
+    # Plugin spec-instance override first (tqkv seam hook), then registry.
+    manager_class = type(kv_cache_spec).get_manager_class()
+    if manager_class is None:
+        manager_class = KVCacheSpecRegistry.get_manager_class(kv_cache_spec)
     assert manager_class is not None, (
         f"No manager registered for KVCacheSpec {type(kv_cache_spec)}"
     )
