@@ -251,6 +251,7 @@ class KVCacheCoordinator(ABC):
         total_computed_tokens: int,
         num_tokens_main_model: int,
         reserved_blocks: int = 0,
+        apply_admission_cap: bool = False,
     ) -> bool:
         """
         Check if all per-group pools have enough free blocks for this request.
@@ -262,11 +263,23 @@ class KVCacheCoordinator(ABC):
         blocks that must be left available; the allocation is only permitted if
         it fits within (free blocks - reserved_blocks). Applied conservatively
         per pool to preserve the single-pool upstream gating semantics.
+
+        ``apply_admission_cap`` mirrors ``get_num_blocks_to_allocate``: when
+        True (set only by the full-sequence admission gate) the per-manager
+        need applies the recycling-aware SWA/chunked-local cap; per-step
+        callers leave it False so the predictor matches ``allocate_new_blocks``.
+        This is the single per-pool-correct admission predicate shared by BOTH
+        the per-step path and the full-sequence gate, so they cannot drift.
         """
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 needed = manager.get_num_blocks_to_allocate(
-                    request_id, num_encoder_tokens, [], 0, num_encoder_tokens
+                    request_id,
+                    num_encoder_tokens,
+                    [],
+                    0,
+                    num_encoder_tokens,
+                    apply_admission_cap=apply_admission_cap,
                 )
             else:
                 needed = manager.get_num_blocks_to_allocate(
@@ -275,6 +288,7 @@ class KVCacheCoordinator(ABC):
                     new_computed_blocks[i],
                     total_computed_tokens,
                     num_tokens_main_model,
+                    apply_admission_cap=apply_admission_cap,
                 )
             available = self.group_pools[i].get_num_free_blocks() - reserved_blocks
             if needed > available:

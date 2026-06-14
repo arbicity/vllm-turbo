@@ -382,17 +382,17 @@ class KVCacheManager:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
-            # TQKV-REBASE-TODO (v0.23.0): this full-sequence admission gate is
-            # NEW in v0.23.0 and was not present when the tqkv per-group split
-            # BlockPool seam was authored. get_num_blocks_to_allocate() returns
-            # a SUM across all managers, but the free-block check below compares
-            # it only against self.block_pool (the first/default pool). Under
-            # per-group split pools (hybrid/compressed-KV), this can over- or
-            # under-count free blocks. The per-step admission path was migrated
-            # to coordinator.has_enough_blocks() (per-pool aware); this gate
-            # should likely be migrated the same way. Left as-is (single-pool
-            # semantics, matches upstream) pending human review — see PR notes.
-            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+            # Per-group-pool admission gate. Upstream v0.23.0 compares a SUM of
+            # blocks-to-allocate across all managers against ONLY self.block_pool
+            # (the first/default pool) — correct for a single uniform pool, but
+            # wrong under the tqkv per-group split BlockPools (hybrid /
+            # compressed-KV): blocks are not fungible across a GDN-layer pool and
+            # an attention-layer pool, so Σneed vs pool[0].free over/under-counts.
+            # Route through coordinator.has_enough_blocks() — the same per-pool
+            # predicate the per-step path uses — for the FULL sequence and with
+            # the admission cap on. Reduces to the exact upstream check when
+            # there is a single pool, so non-hybrid configs are unchanged.
+            if not self.coordinator.has_enough_blocks(
                 request_id=request.request_id,
                 num_tokens=full_num_tokens,
                 new_computed_blocks=new_computed_block_list,
@@ -400,8 +400,7 @@ class KVCacheManager:
                 total_computed_tokens=total_computed_tokens,
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
-            )
-            if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+            ):
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
