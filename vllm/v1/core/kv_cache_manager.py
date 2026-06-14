@@ -382,6 +382,16 @@ class KVCacheManager:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
+            # TQKV-REBASE-TODO (v0.23.0): this full-sequence admission gate is
+            # NEW in v0.23.0 and was not present when the tqkv per-group split
+            # BlockPool seam was authored. get_num_blocks_to_allocate() returns
+            # a SUM across all managers, but the free-block check below compares
+            # it only against self.block_pool (the first/default pool). Under
+            # per-group split pools (hybrid/compressed-KV), this can over- or
+            # under-count free blocks. The per-step admission path was migrated
+            # to coordinator.has_enough_blocks() (per-pool aware); this gate
+            # should likely be migrated the same way. Left as-is (single-pool
+            # semantics, matches upstream) pending human review — see PR notes.
             num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
                 request_id=request.request_id,
                 num_tokens=full_num_tokens,
