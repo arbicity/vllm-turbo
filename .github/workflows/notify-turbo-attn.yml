@@ -1,0 +1,34 @@
+# Notify turbo-attn to rebuild the vllm-tqkv engine image when this fork's
+# tqkv-seam overlay (main) changes. The image is built in turbo-attn (where
+# the Dockerfile + COPY overlay live), so we just fire a repository_dispatch.
+#
+# ── ONE-TIME SETUP ──────────────────────────────────────────────────────────
+#   secrets.TURBO_ATTN_DISPATCH_TOKEN — a fine-grained PAT (or GitHub App
+#       token) with `actions:write` (repository dispatch) on
+#       arbicity/turbo-attn. CROSS-ORG: this fork is in arbi-dev, turbo-attn is
+#       in arbicity, so the org PAT used elsewhere may not span both — provision
+#       a token that can dispatch to arbicity/turbo-attn and add it as a repo
+#       secret here.
+name: notify-turbo-attn
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest   # trivial curl; avoids cross-org self-hosted runner
+    steps:
+      - name: dispatch vllm-fork-updated → turbo-attn build-engine-images
+        env:
+          TOKEN: ${{ secrets.TURBO_ATTN_DISPATCH_TOKEN }}
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/arbicity/turbo-attn/dispatches \
+            -d "{\"event_type\":\"vllm-fork-updated\",\"client_payload\":{\"sha\":\"${GITHUB_SHA}\"}}"
+          echo "dispatched vllm-fork-updated (sha ${GITHUB_SHA})"
