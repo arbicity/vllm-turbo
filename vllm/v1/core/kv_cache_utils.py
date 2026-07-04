@@ -20,7 +20,6 @@ from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
@@ -922,6 +921,26 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
+    # Per-group split pools (hybrid GDN/Mamba + attention): each group owns an
+    # INDEPENDENT BlockPool, so the shared-pool math below — which assumes one
+    # pool and cancels ``num_layer_per_group`` — does not apply and over-reports
+    # capacity by ~the full-attention layer count. Compute concurrency from the
+    # token-scaling (attention) pools directly: each request needs
+    # ``cdiv(max_model_len, block_size)`` blocks per such pool, while O(1)
+    # recurrent (Mamba) groups don't scale with context (they're bounded by
+    # max_mamba_cache_size, not the per-token KV budget). The effective KV-token
+    # capacity is set by the most-constrained token-scaling pool.
+    per_group_nb = getattr(kv_cache_config, "per_group_num_blocks", None)
+    if per_group_nb is not None:
+        max_model_len = vllm_config.model_config.max_model_len
+        token_scaling = [
+            nb / cdiv(max_model_len, group.kv_cache_spec.block_size)
+            for nb, group in zip(per_group_nb, kv_cache_config.kv_cache_groups)
+            if not isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        if token_scaling:
+            return min(token_scaling)
+
     num_layer_per_group = max(
         len(group.layer_names) for group in kv_cache_config.kv_cache_groups
     )
@@ -1078,23 +1097,49 @@ def unify_kv_cache_spec_page_size(
             new_kv_cache_spec[layer_name] = layer_spec
         else:
             layer_page_size = layer_spec.page_size_bytes
-            if max_page_size % layer_page_size == 0:
-                ratio = max_page_size // layer_page_size
-                new_block_size = layer_spec.block_size * ratio
-                new_spec = replace(layer_spec, block_size=new_block_size)
-            elif (
-                isinstance(layer_spec, AttentionSpec)
-                and layer_spec.indexes_kv_by_block_stride
-            ):
-                new_spec = replace(layer_spec, page_size_padded=max_page_size)
-            else:
+            if max_page_size % layer_page_size != 0:
+                # Page sizes not directly divisible. Increase block_size
+                # so this layer's page fills the max page as closely as
+                # possible, then pad the remainder. This minimizes waste
+                # for compressed caches in hybrid (attention + GDN) models.
+                per_token = layer_page_size // layer_spec.block_size
+                if per_token > 0:
+                    new_block_size = (max_page_size // per_token // 16) * 16
+                    if new_block_size < 16:
+                        new_block_size = 16
+                    # TQKV stores kv_cache as uint8 and uses .view(torch.int32)
+                    # on it, which requires stride(1) = max_page_size //
+                    # new_block_size to be divisible by 4. Reduce in steps of
+                    # 16 until the constraint is met.
+                    while (max_page_size // new_block_size) % 4 != 0:
+                        new_block_size -= 16
+                        if new_block_size < 16:
+                            raise NotImplementedError(
+                                f"Cannot find 4-aligned block_size for TQKV "
+                                f"page unification: max_page_size="
+                                f"{max_page_size}, per_token={per_token}"
+                            )
+                    # Safety check: ensure tokens fit within padded page
+                    if new_block_size * per_token > max_page_size:
+                        raise NotImplementedError(
+                            f"Cannot unify page sizes: {new_block_size} "
+                            f"tokens x {per_token} bytes/token = "
+                            f"{new_block_size * per_token} exceeds "
+                            f"max_page_size {max_page_size}."
+                        )
+                    new_spec = replace(
+                        layer_spec,
+                        block_size=new_block_size,
+                        page_size_padded=max_page_size,
+                    )
+                    new_kv_cache_spec[layer_name] = new_spec
+                    continue
                 raise NotImplementedError(
-                    f"Layer {layer_name}: page size is not divisible by the "
-                    "maximum page size and cannot be padded. Padding is only "
-                    "supported for attention layers whose backend indexes KV "
-                    "pages by the block stride (indexes_kv_by_block_stride is "
-                    "True)."
+                    "Cannot unify page sizes: per-token bytes is zero."
                 )
+            ratio = max_page_size // layer_page_size
+            new_block_size = layer_spec.block_size * ratio
+            new_spec = replace(layer_spec, block_size=new_block_size)
             assert new_spec.page_size_bytes == max_page_size
             new_kv_cache_spec[layer_name] = new_spec
     return new_kv_cache_spec
@@ -1341,6 +1386,7 @@ def get_kv_cache_config_from_groups(
         )
 
     # Determine how model runners should initialize the KV cache tensors.
+    per_group_num_blocks = None
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
@@ -1366,37 +1412,144 @@ def get_kv_cache_config_from_groups(
             vllm_config, kv_cache_groups, available_memory
         )
     else:
-        # General case:
-        # We will have group_size memory pools, each is shared by one layer from
-        # each group. As layers of different groups have different block table,
-        # they will use different parts of the shared Tensor.
-        # The memory layout for 3 groups (full.0, full.1), (sw.0, sw.2),
-        # (sw.1, padding) will be: (group_size = 2)
-        # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
-        # full.1, sw.2: share another Tensor with size=available_memory//2
+        # General case: multiple groups with potentially different page sizes.
+        # Each layer gets its own tensor. O(1) groups (mamba in none/align
+        # mode) get a fixed-size allocation based on max_num_seqs, freeing
+        # the remaining memory for O(n) groups (attention) to maximize
+        # KV cache token capacity.
         group_size = max(len(group.layer_names) for group in kv_cache_groups)
-
-        page_size = get_uniform_page_size(
-            [group.kv_cache_spec for group in kv_cache_groups]
-        )
         assert group_size > 0, "group_size must be greater than 0"
-        num_blocks = get_num_blocks(
-            vllm_config, group_size, available_memory, page_size
-        )
-        kv_cache_tensors = []
-        for i in range(group_size):
-            shared_by = []
-            for j in range(len(kv_cache_groups)):
-                if i < len(kv_cache_groups[j].layer_names):
-                    shared_by.append(kv_cache_groups[j].layer_names[i])
-            kv_cache_tensors.append(
-                KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+
+        # Separate O(1) groups (mamba) from O(n) groups (attention)
+        o1_groups = []  # Fixed allocation: max_seqs blocks
+        on_groups = []  # Dynamic allocation: as many blocks as memory allows
+        for group in kv_cache_groups:
+            spec = group.kv_cache_spec
+            if (isinstance(spec, MambaSpec)
+                    and spec.mamba_cache_mode != "all"):
+                o1_groups.append(group)
+            else:
+                on_groups.append(group)
+
+        if o1_groups and on_groups:
+            # Split allocation: fixed mamba pool + dynamic attention pool
+            max_seqs = vllm_config.scheduler_config.max_num_seqs
+            # Mamba needs 1 block per sequence in "none" mode, 2 in "align"
+            # mode (current + committed boundary). Mirror
+            # MambaSpec.max_memory_usage_bytes.
+            _align_factor = (
+                2 if vllm_config.cache_config.mamba_cache_mode == "align" else 1
             )
+            mamba_blocks_per_seq = max(
+                _align_factor + g.kv_cache_spec.num_speculative_blocks
+                for g in o1_groups
+                if isinstance(g.kv_cache_spec, MambaSpec)
+            )
+            # +1 for the null_block that BlockPool always reserves
+            mamba_blocks = max_seqs * mamba_blocks_per_seq + 1
+            # Each o1_group contains len(layer_names) independent layer
+            # tensors, each with its own mamba_blocks-sized pool. Budget
+            # must reflect the TOTAL across all layers, matching the
+            # allocation loop below (for i in range(group_size)
+            # × for group in o1_groups).
+            mamba_per_slot = sum(
+                len(g.layer_names) * g.kv_cache_spec.page_size_bytes
+                for g in o1_groups
+            )
+            mamba_memory = mamba_per_slot * mamba_blocks
+
+            # Remaining memory for attention.
+            #
+            # Reserve headroom for the sampler warmup pass that runs AFTER
+            # KV cache allocation. The sampler allocates logits/metadata
+            # tensors sized O(max_num_seqs * vocab_size), which the profiler
+            # measured during its warmup but then freed before KV allocation.
+            # When the sampler warmup runs again post-allocation, it needs
+            # fresh memory, and compressed KV backends (fp8, int8, tqkv, ...)
+            # tend to fill memory with near-zero rounding slack — so the
+            # sampler OOMs unless we reserve explicit headroom.
+            #
+            # Default: auto-compute from vocab_size * max_seqs * 8 bytes * 5
+            # tensors (logits, probs, top_p/k/temp, overhead). Override via
+            # VLLM_SAMPLER_RESERVE_MIB env var (0 = use auto-computed value).
+            import os as _os
+            _sampler_reserve_mib = int(_os.environ.get(
+                "VLLM_SAMPLER_RESERVE_MIB", "0"))
+            if _sampler_reserve_mib == 0:
+                try:
+                    vocab = vllm_config.model_config.get_vocab_size()
+                    _sampler_reserve_bytes = vocab * max_seqs * 8 * 5
+                except Exception:
+                    _sampler_reserve_bytes = 512 * 1024 * 1024
+            else:
+                _sampler_reserve_bytes = _sampler_reserve_mib * 1024 * 1024
+            attn_memory = available_memory - mamba_memory - _sampler_reserve_bytes
+            if attn_memory < 0:
+                attn_memory = 0
+            attn_per_slot = sum(
+                g.kv_cache_spec.page_size_bytes for g in on_groups
+            )
+            attn_group_size = max(
+                len(g.layer_names) for g in on_groups
+            ) if on_groups else 1
+            num_blocks = int(
+                attn_memory // attn_per_slot // attn_group_size
+            ) if attn_per_slot > 0 else 0
+            num_blocks = max(num_blocks, 0)
+            num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+
+            # Build per_group_num_blocks: map each group to its block count
+            o1_set = set(id(g) for g in o1_groups)
+            per_group_num_blocks = [
+                mamba_blocks if id(g) in o1_set else num_blocks
+                for g in kv_cache_groups
+            ]
+
+            # Build tensors: attention layers get num_blocks, mamba gets
+            # mamba_blocks
+            kv_cache_tensors = []
+            for i in range(group_size):
+                for group in on_groups:
+                    if i < len(group.layer_names):
+                        kv_cache_tensors.append(KVCacheTensor(
+                            size=group.kv_cache_spec.page_size_bytes
+                                 * num_blocks,
+                            shared_by=[group.layer_names[i]],
+                        ))
+                for group in o1_groups:
+                    if i < len(group.layer_names):
+                        kv_cache_tensors.append(KVCacheTensor(
+                            size=group.kv_cache_spec.page_size_bytes
+                                 * mamba_blocks,
+                            shared_by=[group.layer_names[i]],
+                        ))
+        else:
+            # No split needed — all groups are O(n). Use the original
+            # shared-tensor approach: group_size pools, each shared by
+            # one layer from each group.
+            page_size = get_uniform_page_size(
+                [group.kv_cache_spec for group in kv_cache_groups]
+            )
+            num_blocks = get_num_blocks(
+                vllm_config, group_size, available_memory, page_size
+            )
+            kv_cache_tensors = []
+            for i in range(group_size):
+                shared_by = []
+                for j in range(len(kv_cache_groups)):
+                    if i < len(kv_cache_groups[j].layer_names):
+                        shared_by.append(kv_cache_groups[j].layer_names[i])
+                kv_cache_tensors.append(
+                    KVCacheTensor(
+                        size=page_size * num_blocks, shared_by=shared_by
+                    )
+                )
 
     return KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
+        per_group_num_blocks=per_group_num_blocks,
     )
 
 
@@ -1745,11 +1898,26 @@ def get_kv_cache_groups(
         if not isinstance(v, HiddenStateCacheSpec)
     }
 
-    # As KVCacheManager can only allocate memory of one size, we need to unify
-    # the page size of the layers. For cases cannot be unified, this function
-    # will raise an error.
-    filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
-    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+    # O(1) mamba groups + O(n) attention groups: skip page unification —
+    # per-group BlockPool gives each group its own tensors, so they don't
+    # need matching page sizes. This avoids inflating attention pages (e.g.
+    # 32KB) to match large mamba pages (e.g. 1MB), wasting ~97% of attention
+    # memory. The split allocator in get_kv_cache_config_from_groups handles
+    # the different page sizes via per-group BlockPools.
+    has_o1_mamba = any(
+        isinstance(spec, MambaSpec) and spec.mamba_cache_mode != "all"
+        for spec in filtered_spec.values()
+    )
+    has_on_attn = any(
+        not isinstance(spec, MambaSpec) for spec in filtered_spec.values()
+    )
+    if has_o1_mamba and has_on_attn:
+        groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+    else:
+        # As KVCacheManager can only allocate memory of one size, unify the
+        # page size of the layers. Cases that cannot be unified raise an error.
+        unified_spec = unify_kv_cache_spec_page_size(filtered_spec)
+        groups = _get_kv_cache_groups_uniform_page_size(unified_spec)
 
     # Add hidden-state layers back with page aligned to the common page.
     if hidden_specs:
@@ -1847,18 +2015,25 @@ def _max_memory_usage_bytes_from_groups(
             total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
         return total_max_mem_usage_bytes
 
-    # General case: group_size pools, each shared by one layer per group
-    # Memory = group_size * page_size * blocks_for_max_len
+    # General case: sum max memory across all groups.
+    # For uniform-page hybrids: group_size * page_size * blocks_needed.
+    # For split hybrids (O(1) mamba + O(n) attention): sum per-group.
     group_size = max(len(group.layer_names) for group in kv_cache_groups)
-    page_size = get_uniform_page_size(
-        [group.kv_cache_spec for group in kv_cache_groups]
-    )
-    blocks_needed = sum(
-        cdiv(group.kv_cache_spec.max_memory_usage_bytes(vllm_config), page_size)
-        for group in kv_cache_groups
-    )
-
-    return group_size * page_size * blocks_needed
+    page_sizes = set(g.kv_cache_spec.page_size_bytes for g in kv_cache_groups)
+    if len(page_sizes) == 1:
+        page_size = page_sizes.pop()
+        any_spec = kv_cache_groups[0].kv_cache_spec
+        blocks_needed = cdiv(
+            any_spec.max_memory_usage_bytes(vllm_config), page_size
+        )
+        return group_size * page_size * blocks_needed
+    else:
+        # Non-uniform pages: sum each group's max usage independently
+        return sum(
+            len(g.layer_names)
+            * g.kv_cache_spec.max_memory_usage_bytes(vllm_config)
+            for g in kv_cache_groups
+        )
 
 
 def _estimate_max_model_len_from_groups(
@@ -2121,34 +2296,87 @@ def get_kv_cache_configs(
     # Change the num_blocks of each rank to the smallest among all ranks.
     # We also need to shrink the tensor size proportionally to avoid
     # allocating unused memory.
-    min_num_blocks = min(
-        kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+    has_per_group = any(
+        c.per_group_num_blocks is not None for c in kv_cache_configs
     )
-    for kv_cache_config in kv_cache_configs:
-        num_blocks_old = kv_cache_config.num_blocks
-        kv_cache_config.num_blocks = min_num_blocks
 
-        # Shrink tensor size proportionally
-        for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+    if has_per_group:
+        # Per-group block counts: shrink each group independently.
+        # Build layer_name → group_id mapping from the first config.
+        ref_config = kv_cache_configs[0]
+        layer_to_group: dict[str, int] = {}
+        for gid, group in enumerate(ref_config.kv_cache_groups):
+            for layer_name in group.layer_names:
+                layer_to_group[layer_name] = gid
 
-        if len(kv_cache_config.kv_cache_groups) > 0:
-            max_model_len = vllm_config.model_config.max_model_len
-            # GPU KV cache size in tokens = max_concurrency * max_model_len:
-            # the total tokens of context the pool can hold at peak
-            # utilization. Sourcing this from the concurrency calculation
-            # handles hybrid layouts correctly.
-            num_tokens, max_concurrency = get_kv_cache_capacity(
-                vllm_config, kv_cache_config
+        num_groups = len(ref_config.kv_cache_groups)
+        # Find min per-group block count across workers
+        min_per_group = [
+            min(
+                c.per_group_num_blocks[g]  # type: ignore[index]
+                for c in kv_cache_configs
             )
+            for g in range(num_groups)
+        ]
 
-            logger.info_once("GPU KV cache size: %s tokens", f"{num_tokens:,}")
-            logger.info_once(
-                "Maximum concurrency for %s tokens per request: %.2fx",
-                f"{max_model_len:,}",
-                max_concurrency,
-            )
+        for kv_cache_config in kv_cache_configs:
+            old_per_group = list(kv_cache_config.per_group_num_blocks)  # type: ignore[arg-type]
+            kv_cache_config.per_group_num_blocks = min_per_group
+            # num_blocks tracks the primary (attention) block count
+            kv_cache_config.num_blocks = max(min_per_group) if min_per_group else 0
+
+            # Shrink each tensor based on its group's block count
+            for tensor in kv_cache_config.kv_cache_tensors:
+                gid = layer_to_group[tensor.shared_by[0]]
+                old_nb = old_per_group[gid]
+                new_nb = min_per_group[gid]
+                if old_nb > 0:
+                    assert tensor.size % old_nb == 0, (
+                        f"Tensor size {tensor.size} not divisible by "
+                        f"old num_blocks {old_nb} for group {gid}"
+                    )
+                    tensor.size = tensor.size // old_nb * new_nb
+
+            if len(kv_cache_config.kv_cache_groups) > 0:
+                max_model_len = vllm_config.model_config.max_model_len
+                num_tokens, max_concurrency = get_kv_cache_capacity(
+                    vllm_config, kv_cache_config
+                )
+                logger.info_once(
+                    "GPU KV cache size: %s tokens", f"{num_tokens:,}"
+                )
+                logger.info_once(
+                    "Maximum concurrency for %s tokens per request: %.2fx",
+                    f"{max_model_len:,}",
+                    max_concurrency,
+                )
+    else:
+        # Original single-pool logic
+        min_num_blocks = min(
+            kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+        )
+        for kv_cache_config in kv_cache_configs:
+            num_blocks_old = kv_cache_config.num_blocks
+            kv_cache_config.num_blocks = min_num_blocks
+
+            # Shrink tensor size proportionally
+            for tensor in kv_cache_config.kv_cache_tensors:
+                assert tensor.size % num_blocks_old == 0
+                tensor.size = tensor.size // num_blocks_old * min_num_blocks
+
+            if len(kv_cache_config.kv_cache_groups) > 0:
+                max_model_len = vllm_config.model_config.max_model_len
+                num_tokens, max_concurrency = get_kv_cache_capacity(
+                    vllm_config, kv_cache_config
+                )
+                logger.info_once(
+                    "GPU KV cache size: %s tokens", f"{num_tokens:,}"
+                )
+                logger.info_once(
+                    "Maximum concurrency for %s tokens per request: %.2fx",
+                    f"{max_model_len:,}",
+                    max_concurrency,
+                )
 
     return kv_cache_configs
 

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -168,6 +168,13 @@ class KVCacheManager:
             )
             for group in kv_cache_config.kv_cache_groups
         )
+        # Collect unique pools for multi-pool operations (reset, events)
+        seen_ids: set[int] = set()
+        self._unique_pools: list = []
+        for pool in self.coordinator.group_pools:
+            if id(pool) not in seen_ids:
+                seen_ids.add(id(pool))
+                self._unique_pools.append(pool)
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
         # via create_kv_cache_blocks instead of creating new ones to avoid GC
@@ -178,14 +185,34 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
+        # Pre-step callbacks for external (plugin) KV backends; fired
+        # from new_step_starts() before coordinator bookkeeping.
+        self._pre_step_callbacks: list[Callable[["KVCacheManager"], None]] = []
+
+        # Backend lifecycle hook: lets the user-selected attention backend
+        # register pre-step callbacks or other manager-side state. Used
+        # by compressed-KV backends with a cold-tier eviction adapter.
+        try:
+            from vllm.config import get_current_vllm_config
+            from vllm.v1.attention.backend import AttentionBackend
+            _vllm_cfg = get_current_vllm_config()
+            _backend_cls = AttentionBackend.resolve_user_selected_backend(_vllm_cfg)
+            if _backend_cls is not None:
+                _backend_cls.on_kv_manager_created(self)
+        except Exception:
+            # Hook is advisory; never fatal during manager construction.
+            pass
+
     @property
     def usage(self) -> float:
         """Get the KV cache usage.
 
         Returns:
             The KV cache usage (between 0.0 and 1.0).
+            With per-group pools, returns the max usage across all pools
+            since any full pool blocks new requests.
         """
-        return self.block_pool.get_usage()
+        return max(pool.get_usage() for pool in self._unique_pools)
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -373,7 +400,17 @@ class KVCacheManager:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
-            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+            # Per-group-pool admission gate. Upstream v0.23.0 compares a SUM of
+            # blocks-to-allocate across all managers against ONLY self.block_pool
+            # (the first/default pool) — correct for a single uniform pool, but
+            # wrong under the tqkv per-group split BlockPools (hybrid /
+            # compressed-KV): blocks are not fungible across a GDN-layer pool and
+            # an attention-layer pool, so Σneed vs pool[0].free over/under-counts.
+            # Route through coordinator.has_enough_blocks() — the same per-pool
+            # predicate the per-step path uses — for the FULL sequence and with
+            # the admission cap on. Reduces to the exact upstream check when
+            # there is a single pool, so non-hybrid configs are unchanged.
+            if not self.coordinator.has_enough_blocks(
                 request_id=request.request_id,
                 num_tokens=full_num_tokens,
                 new_computed_blocks=new_computed_block_list,
@@ -381,9 +418,8 @@ class KVCacheManager:
                 total_computed_tokens=total_computed_tokens,
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
-            )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
+                watermark_blocks=watermark_blocks,
+            ):
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -401,7 +437,7 @@ class KVCacheManager:
             request.request_id, total_computed_tokens
         )
 
-        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+        if not self.coordinator.has_enough_blocks(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
@@ -409,14 +445,10 @@ class KVCacheManager:
             total_computed_tokens=num_local_computed_tokens
             + num_external_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
-        )
-
-        # Keep `reserved_blocks` free for other in-flight sequences, and an
-        # additional watermark of headroom for waiting/preempted admissions.
-        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        required_blocks = num_blocks_to_allocate + watermark_blocks
-        if required_blocks > available_blocks:
-            # Cannot allocate new blocks
+            reserved_blocks=reserved_blocks,
+            watermark_blocks=watermark_blocks,
+        ):
+            # Cannot allocate new blocks in one or more pools
             return None
 
         if (
@@ -499,7 +531,23 @@ class KVCacheManager:
         Args:
             block_ids: Set of block IDs to evict from cache.
         """
-        self.block_pool.evict_blocks(block_ids)
+        if len(self._unique_pools) == 1:
+            self._unique_pools[0].evict_blocks(block_ids)
+        else:
+            # With per-group pools, block IDs are pool-local (both start
+            # from 0). We must evict only from the pool that owns each
+            # block. Build a reverse map from block_id -> pool by
+            # checking which pool's cached_block_hash_to_block contains
+            # the block.
+            for pool in self._unique_pools:
+                pool_ids = set()
+                for bid in block_ids:
+                    if bid < pool.num_gpu_blocks:
+                        blk = pool.blocks[bid]
+                        if blk.block_hash is not None:
+                            pool_ids.add(bid)
+                if pool_ids:
+                    pool.evict_blocks(pool_ids)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -510,7 +558,7 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        if not self.block_pool.reset_prefix_cache():
+        if not all(pool.reset_prefix_cache() for pool in self._unique_pools):
             return False
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -557,7 +605,11 @@ class KVCacheManager:
         Returns:
             A list of KV cache events.
         """
-        events = self.block_pool.take_events()
+        # Per-group pools (hybrid): collect events from each unique pool,
+        # then annotate with semantic KV cache spec metadata by group.
+        events: list[KVCacheEvent] = []
+        for pool in self._unique_pools:
+            events.extend(pool.take_events())
         for event in events:
             if not isinstance(event, BlockStored):
                 continue
@@ -610,5 +662,88 @@ class KVCacheManager:
         return ids
 
     def new_step_starts(self) -> None:
-        """Called when a new step is started."""
+        """Called when a new step is started. Pre-step callbacks fire
+        BEFORE coordinator bookkeeping so any block_pool free they issue
+        is visible to this step's allocate_slots()."""
+        for cb in self._pre_step_callbacks:
+            try:
+                cb(self)
+            except Exception:
+                logger.exception("Pre-step KV callback %r raised.", cb)
         self.coordinator.new_step_starts()
+
+    def register_pre_step_callback(
+        self, cb: Callable[["KVCacheManager"], None]
+    ) -> None:
+        """Register a pre-step callback (idempotent)."""
+        if cb not in self._pre_step_callbacks:
+            self._pre_step_callbacks.append(cb)
+
+    def drain_request_blocks(
+        self, request_id: str, block_ids: Sequence[int]
+    ) -> int:
+        """Null ``request_id`` slots in each single_type_manager matching
+        ``block_ids``, then batch free to the pool. Mirrors
+        :meth:`SingleTypeKVCacheManager.remove_skipped_blocks`; UAF-safe
+        because req_to_blocks is mutated before any reallocation. Ref-count
+        semantics handled by :meth:`BlockPool.free_blocks`."""
+        if not block_ids:
+            return 0
+        wanted = set(block_ids)
+        freed_total = 0
+        for manager in self.coordinator.single_type_managers:
+            req_blocks = manager.req_to_blocks.get(request_id)
+            if not req_blocks:
+                continue
+            to_free: list[KVCacheBlock] = []
+            for i, blk in enumerate(req_blocks):
+                if blk is manager._null_block:
+                    continue
+                if blk.block_id in wanted:
+                    to_free.append(blk)
+                    req_blocks[i] = manager._null_block
+            if to_free:
+                manager.block_pool.free_blocks(to_free)
+                freed_total += len(to_free)
+        return freed_total
+
+    def allocate_archive_blocks(
+        self, request_id: str, num_blocks: int
+    ) -> list[int]:
+        """Allocate ``num_blocks`` fresh physical pages from the same
+        block pool that backs :meth:`allocate_slots`, append them to
+        ``request_id``'s ``req_to_blocks`` in each single_type_manager,
+        and return the new ``block_id`` list.
+
+        Companion to :meth:`drain_request_blocks` for cold-tier 3-zone
+        retention: the cold-tier hot path drains source pages and
+        immediately allocates archive pages to hold the heavy hitters.
+
+        Does NOT advance the request's logical seq_len — caller adjusts
+        ``compacted_seq_lens`` separately to account for the dropped
+        slots in the eviction zone.
+
+        Raises ``ValueError`` if the pool is too short on capacity. The
+        cold-tier mediator must have called
+        :meth:`get_num_free_blocks` first to gate the allocation.
+        """
+        if num_blocks <= 0:
+            return []
+        # Allocate from the first single_type_manager's block_pool;
+        # all single_type_managers share the same pool by construction
+        # in vLLM's V1 (see ``KVCacheCoordinator``).
+        block_pool = self.coordinator.single_type_managers[0].block_pool
+        new_blocks = block_pool.get_new_blocks(num_blocks)
+        # Append to every single_type_manager's req_to_blocks for this
+        # request — keeps the per-manager block_table tensors in sync.
+        for manager in self.coordinator.single_type_managers:
+            req_blocks = manager.req_to_blocks.get(request_id)
+            if req_blocks is None:
+                # The request is not registered with this manager (can
+                # happen when a hybrid model has manager kinds that
+                # don't apply to the request, e.g. mamba-only path on a
+                # hybrid attn+mamba model). Skip — the manager that
+                # does own this request will handle it.
+                continue
+            req_blocks.extend(new_blocks)
+        return [b.block_id for b in new_blocks]

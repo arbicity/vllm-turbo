@@ -1205,11 +1205,38 @@ class SpecDecodeBaseProposer:
         # Note (matt): Never inherit the attention backend from base, because there are
         # many opportunities for incompatibility, so we always independently autoselect
         # unless explicitly specified in the speculative config.
+        #
+        # tqkv (fork) exception: when the target runs a plugin KV-cache dtype
+        # (e.g. ``--kv-cache-dtype tqkv``), the draft shares the SAME kv-cache
+        # group and dtype, so it must use the SAME plugin attention backend
+        # (TURBO_ATTN). That backend is registered out-of-tree and is NOT in
+        # ``_get_backend_priorities``, so autoselect would fail with
+        # "No valid attention backend found ... kv_cache_dtype=tqkv". If the
+        # spec config didn't explicitly pin a draft backend, inherit the
+        # target's backend in that case.
+        draft_backend = spec_cfg.attention_backend
+        if draft_backend is None:
+            from vllm.config.cache import is_plugin_cache_dtype
+
+            base_cache_config = base.cache_config
+            if (
+                base_cache_config is not None
+                and is_plugin_cache_dtype(base_cache_config.cache_dtype)
+                and base.attention_config.backend is not None
+            ):
+                draft_backend = base.attention_config.backend
+                logger.info(
+                    "Draft model inherits target attention backend %s for "
+                    "plugin KV-cache dtype %r.",
+                    draft_backend,
+                    base_cache_config.cache_dtype,
+                )
+
         base = replace(
             base,
             attention_config=replace(
                 base.attention_config,
-                backend=spec_cfg.attention_backend,
+                backend=draft_backend,
             ),
         )
 

@@ -390,6 +390,17 @@ class Worker(WorkerBase):
                 self.model_runner.get_model(),
             )
 
+        # Backend lifecycle hook: lets the user-selected attention backend
+        # apply one-time weight transforms (e.g. fold a per-layer matrix
+        # into a downstream Linear) once the model is fully loaded.
+        try:
+            from vllm.v1.attention.backend import AttentionBackend
+            _backend_cls = AttentionBackend.resolve_user_selected_backend(self.vllm_config)
+            if _backend_cls is not None:
+                _backend_cls.on_model_loaded(self, self.model_runner.model)
+        except Exception as _e:
+            logger.warning("on_model_loaded hook failed: %s", _e)
+
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
 
@@ -549,6 +560,21 @@ class Worker(WorkerBase):
                     suggested_util,
                 )
 
+        # Backend KV-budget hook: lets the user-selected backend adjust
+        # the profiler-derived budget (e.g. compressed-KV backend on a
+        # hybrid model whose profiler over-counts non-KV memory).
+        try:
+            from vllm.v1.attention.backend import AttentionBackend
+            _backend_cls = AttentionBackend.resolve_user_selected_backend(self.vllm_config)
+            if _backend_cls is not None:
+                _adjusted = _backend_cls.adjust_kv_budget(
+                    int(self.available_kv_cache_memory_bytes), self.vllm_config,
+                )
+                if _adjusted is not None and _adjusted > 0:
+                    self.available_kv_cache_memory_bytes = _adjusted
+        except Exception as _e:
+            logger.warning("adjust_kv_budget hook failed: %s", _e)
+
         return int(self.available_kv_cache_memory_bytes)
 
     def get_kv_connector_handshake_metadata(
@@ -618,6 +644,21 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        # Backend lifecycle hook: KV cache is allocated (initialize_kv_cache
+        # ran in initialize_from_config) but CUDA-graph capture has NOT
+        # started yet — the eager, pre-capture window a compressed-KV
+        # backend needs to warm any per-(k_bw,v_bw) decode autotune so a
+        # smart-mix bundle doesn't re-sweep lazily during capture. No-op
+        # for backends that don't define the hook.
+        try:
+            from vllm.v1.attention.backend import AttentionBackend
+
+            _backend_cls = AttentionBackend.resolve_user_selected_backend(self.vllm_config)
+            if _backend_cls is not None and hasattr(_backend_cls, "on_kv_cache_initialized"):
+                _backend_cls.on_kv_cache_initialized(self)
+        except Exception as _e:
+            logger.warning("on_kv_cache_initialized hook failed: %s", _e)
+
         warmup_sizes: list[int] = []
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:

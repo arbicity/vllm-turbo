@@ -9,14 +9,18 @@ from pydantic import Field, field_validator, model_validator
 
 from vllm.config.utils import config
 from vllm.logger import init_logger
-from vllm.utils.torch_utils import (
-    is_quantized_kv_cache,
-    kv_cache_uses_per_token_head_scales,
-)
+try:
+    from vllm.utils.torch_utils import (
+        is_quantized_kv_cache,
+        kv_cache_uses_per_token_head_scales,
+    )
+except ImportError:
+    from vllm.v1.attention.backend import is_quantized_kv_cache
+    kv_cache_uses_per_token_head_scales = lambda x: False
 
 logger = init_logger(__name__)
 
-CacheDType = Literal[
+_BUILTIN_CACHE_DTYPES: frozenset[str] = frozenset({
     "auto",
     "float16",
     "bfloat16",
@@ -32,7 +36,49 @@ CacheDType = Literal[
     "int8_per_token_head",
     "fp8_per_token_head",
     "nvfp4",
-]
+})
+# Plugin-registered dtypes added at runtime via register_cache_dtype().
+_PLUGIN_CACHE_DTYPES: set[str] = set()
+
+# Kept as a type alias; argparse validation now goes through
+# validate_cache_dtype() which consults the runtime registry. The builtin
+# set above (incl. vLLM's native ``turboquant_*``) is the source of truth;
+# plugins (e.g. tqkv) add names at runtime via register_cache_dtype().
+CacheDType = str
+
+
+def register_cache_dtype(name: str, torch_dtype) -> None:
+    """Register a custom KV cache dtype contributed by a plugin.
+
+    After this call, ``--kv-cache-dtype <name>`` will be accepted by
+    argparse and the name will be mapped to ``torch_dtype`` in
+    STR_DTYPE_TO_TORCH_DTYPE.
+    """
+    from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+    _PLUGIN_CACHE_DTYPES.add(name)
+    STR_DTYPE_TO_TORCH_DTYPE[name] = torch_dtype
+
+
+def validate_cache_dtype(name: str) -> str:
+    """argparse ``type=`` callable. Validates against builtins + plugins."""
+    allowed = _BUILTIN_CACHE_DTYPES | _PLUGIN_CACHE_DTYPES
+    if name not in allowed:
+        raise ValueError(
+            f"Unknown --kv-cache-dtype {name!r}. "
+            f"Allowed: {sorted(allowed)}"
+        )
+    return name
+
+
+def is_plugin_cache_dtype(name: str) -> bool:
+    """Return True if ``name`` was registered via ``register_cache_dtype``.
+
+    Used by arg post-processing to auto-default ``--attention-backend`` to
+    ``CUSTOM`` when the user selects a plugin-registered KV cache dtype.
+    """
+    return name in _PLUGIN_CACHE_DTYPES
+
+
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
@@ -115,6 +161,13 @@ class CacheConfig:
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
+    kv_cache_dtype_skip_layers_dtype: str = "auto"
+    """KV cache dtype to use for layers skipped by `kv_cache_dtype_skip_layers`.
+    Defaults to "auto" (= model's native bf16/fp16). Setting this to "fp8",
+    "fp8_e4m3", or "fp8_e5m2" halves the KV bytes for skip layers at
+    near-lossless quality — useful for recovering capacity lost to boundary
+    protection. Env var `VLLM_KV_CACHE_SKIP_LAYERS_DTYPE` overrides this
+    field when the field is default ("auto")."""
     mamba_page_size_padded: int | None = None
     """ Optional override for mamba page size; used by hybrid mamba/attention
     models to ensure exact alignment with attention page size."""

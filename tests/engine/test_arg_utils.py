@@ -842,3 +842,68 @@ class TestDpDeviceIdSharding:
             get_physical_gpu_ids_for_local_dp_rank(
                 evar, local_dp_rank=2, world_size=2, user_assigned_gpu_ids=[4, 5, 6, 7]
             )
+
+
+def test_plugin_kv_cache_dtype_auto_selects_custom_attention_backend():
+    """A plugin-registered kv-cache dtype should auto-default the attention
+    backend to CUSTOM, but only when the user did not pass an explicit choice.
+    """
+    import torch
+
+    from vllm.config.cache import (
+        _PLUGIN_CACHE_DTYPES,
+        register_cache_dtype,
+    )
+    from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    PLUGIN_NAME = "test_plugin_kv_dtype"
+    register_cache_dtype(PLUGIN_NAME, torch.uint8)
+    try:
+        parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+        # 1. Plugin dtype + no --attention-backend → CUSTOM auto-selected.
+        args = parser.parse_args(
+            [
+                "--model",
+                "facebook/opt-125m",
+                "--kv-cache-dtype",
+                PLUGIN_NAME,
+            ]
+        )
+        engine_args = EngineArgs.from_cli_args(args)
+        vllm_config = engine_args.create_engine_config()
+        assert vllm_config.attention_config.backend == (
+            AttentionBackendEnum.CUSTOM
+        )
+
+        # 2. Plugin dtype + explicit --attention-backend → user choice honoured.
+        args = parser.parse_args(
+            [
+                "--model",
+                "facebook/opt-125m",
+                "--kv-cache-dtype",
+                PLUGIN_NAME,
+                "--attention-backend",
+                "FLASH_ATTN",
+            ]
+        )
+        engine_args = EngineArgs.from_cli_args(args)
+        vllm_config = engine_args.create_engine_config()
+        assert vllm_config.attention_config.backend == (
+            AttentionBackendEnum.FLASH_ATTN
+        )
+
+        # 3. Builtin dtype "auto" → no auto-override (stays None).
+        args = parser.parse_args(
+            [
+                "--model",
+                "facebook/opt-125m",
+            ]
+        )
+        engine_args = EngineArgs.from_cli_args(args)
+        vllm_config = engine_args.create_engine_config()
+        assert vllm_config.attention_config.backend is None
+    finally:
+        _PLUGIN_CACHE_DTYPES.discard(PLUGIN_NAME)
+        STR_DTYPE_TO_TORCH_DTYPE.pop(PLUGIN_NAME, None)
