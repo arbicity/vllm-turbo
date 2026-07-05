@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
-from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)

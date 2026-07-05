@@ -17,7 +17,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_sliding_window,
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
@@ -122,6 +122,7 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        watermark: float = 0.0,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -155,6 +156,11 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+
+        # Watermark: minimum number of KV cache blocks to keep free when
+        # admitting waiting/preempted requests, to avoid frequent preemptions.
+        assert watermark >= 0.0, "watermark must be non-negative"
+        self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
         self.kv_cache_event_metadata = tuple(
             (
                 get_kv_cache_spec_kind(group.kv_cache_spec).value,
@@ -274,6 +280,7 @@ class KVCacheManager:
         num_encoder_tokens: int = 0,
         full_sequence_must_fit: bool = False,
         reserved_blocks: int = 0,
+        has_scheduled_reqs: bool = True,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -304,6 +311,8 @@ class KVCacheManager:
                 made if it fits within (free blocks - reserved_blocks). Used to gate
                 async KV-connector loads so their initial allocation cannot consume
                 blocks an already in-flight (prefilling) sequence is relying on.
+            has_scheduled_reqs: Whether any requests are already scheduled to run
+                this step, controls whether watermark is applied.
 
         Blocks layout:
         ```
@@ -378,6 +387,15 @@ class KVCacheManager:
             self.max_model_len,
         )
 
+        watermark_blocks = 0
+        # The watermark is applied to waiting/preempted requests only, and only
+        # when there's at least one request already scheduled.
+        if has_scheduled_reqs and request.status in (
+            RequestStatus.WAITING,
+            RequestStatus.PREEMPTED,
+        ):
+            watermark_blocks = self.watermark_blocks
+
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
@@ -400,6 +418,7 @@ class KVCacheManager:
                 total_computed_tokens=total_computed_tokens,
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
+                watermark_blocks=watermark_blocks,
             ):
                 return None
 
@@ -427,6 +446,7 @@ class KVCacheManager:
             + num_external_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
             reserved_blocks=reserved_blocks,
+            watermark_blocks=watermark_blocks,
         ):
             # Cannot allocate new blocks in one or more pools
             return None
@@ -491,6 +511,19 @@ class KVCacheManager:
                 local computed tokens and external computed tokens.
         """
         self.coordinator.remove_skipped_blocks(request_id, total_computed_tokens)
+
+    def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:
+        """Pop the request's bookkeeping and return its blocks without
+        returning them to the block pool. The caller must eventually free
+        them in reverse order (so that tail blocks are evicted first).
+
+        Args:
+            request: The request to pop the blocks for.
+
+        Returns:
+            The request's blocks in allocation order.
+        """
+        return self.coordinator.pop_blocks_for_free(request.request_id)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

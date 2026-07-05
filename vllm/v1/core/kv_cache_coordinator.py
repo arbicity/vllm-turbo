@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
@@ -36,18 +37,18 @@ def _validate_prefix_cache_retention_interval(
     if retention_interval is None:
         return
 
-    # Retention only sparsifies sliding-window checkpoints for now; every other
-    # manager (full attention, Mamba, chunked-local) caches densely and
-    # ignores it to be conservative.
-    # TODO: Support Mamba/linear attention.
+    # Retention sparsifies sliding-window and Mamba (linear-attention)
+    # checkpoints; full-attention and chunked-local groups cache densely and
+    # ignore it (their hit granularity must stay fine).
     if not any(
-        isinstance(g.kv_cache_spec, SlidingWindowSpec)
+        isinstance(g.kv_cache_spec, (SlidingWindowSpec, MambaSpec))
         for g in kv_cache_config.kv_cache_groups
     ):
         raise ValueError(
             "VLLM_PREFIX_CACHE_RETENTION_INTERVAL is set but this model has "
-            "no sliding-window KV cache group, so retention has no effect. "
-            "Unset it (the feature only applies to sliding-window attention)."
+            "no sliding-window or Mamba KV cache group, so retention has no "
+            "effect. Unset it (it only applies to sliding-window and Mamba "
+            "attention)."
         )
 
     if retention_interval < 0 or retention_interval % scheduler_block_size != 0:
@@ -252,6 +253,7 @@ class KVCacheCoordinator(ABC):
         num_tokens_main_model: int,
         reserved_blocks: int = 0,
         apply_admission_cap: bool = False,
+        watermark_blocks: int = 0,
     ) -> bool:
         """
         Check if all per-group pools have enough free blocks for this request.
@@ -291,7 +293,9 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             available = self.group_pools[i].get_num_free_blocks() - reserved_blocks
-            if needed > available:
+            # Apply the waiting/preempted watermark headroom per pool (upstream
+            # v0.24.0 added it to the single-pool required-vs-free comparison).
+            if needed + watermark_blocks > available:
                 return False
         return True
 
@@ -313,13 +317,33 @@ class KVCacheCoordinator(ABC):
             num_local_computed_tokens: The number of local computed tokens.
             num_external_computed_tokens: The number of external computed tokens.
         """
+        # A running request is already tracked in num_cached_block and won't
+        # have new prefix-cache hits, so this is a no-op for it.
+        if any(
+            request_id in manager.num_cached_block
+            for manager in self.single_type_managers
+        ):
+            assert all(len(blocks) == 0 for blocks in new_computed_blocks)
+            return
+
+        # Two-phase allocation (issue #33775): first touch every group's local
+        # cache-hit blocks, then allocate external blocks for every group. This
+        # ensures an earlier group's external `get_new_blocks` cannot evict a
+        # later group's not-yet-touched cache-hit blocks.
         for i, manager in enumerate(self.single_type_managers):
-            manager.allocate_new_computed_blocks(
+            manager.add_local_computed_blocks(
                 request_id,
                 new_computed_blocks[i],
                 num_local_computed_tokens,
                 num_external_computed_tokens,
             )
+        if num_external_computed_tokens > 0:
+            for manager in self.single_type_managers:
+                manager.allocate_external_computed_blocks(
+                    request_id,
+                    num_local_computed_tokens,
+                    num_external_computed_tokens,
+                )
 
     def allocate_new_blocks(
         self,
@@ -382,6 +406,25 @@ class KVCacheCoordinator(ABC):
         """
         for manager in self.single_type_managers:
             manager.free(request_id)
+
+    def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+        """
+        Pop the request's bookkeeping from all single-type managers and
+        return its blocks without returning them to the block pool. The
+        caller must eventually pass the returned blocks to
+        `block_pool.free_blocks`, freeing them in reverse order (so that
+        tail blocks are evicted first).
+
+        Args:
+            request_id: The request ID.
+
+        Returns:
+            The request's blocks in allocation order.
+        """
+        blocks: list[KVCacheBlock] = []
+        for manager in self.single_type_managers:
+            blocks.extend(manager.pop_blocks_for_free(request_id))
+        return blocks
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """
@@ -723,6 +766,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_length = max_cache_hit_length
+        longest_hit_length = 0
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
 
         # Simple hybrid (1 full attn + 1 other): one iteration suffices.
@@ -787,6 +831,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 for group_id, blocks in zip(group_ids, hit_blocks):
                     hit_blocks_by_group[group_id] = blocks
 
+                longest_hit_length = max(longest_hit_length, curr_hit_length)
+
             if curr_hit_length >= hit_length:
                 break
             hit_length = curr_hit_length
@@ -801,9 +847,51 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 if (blks := hit_blocks_by_group[group_id]) is not None:
                     del blks[num_blocks:]
 
+        # Uncached shared prefix detection: If any attn. group cached a longer prefix
+        # than the current prefix, it is an uncached common prefix across requests:
+        self.num_uncached_common_prefix_tokens = longest_hit_length - hit_length
         return tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
         ), hit_length
+
+    def find_longest_cache_hit_per_group(
+        self,
+        block_hashes: list[BlockHash],
+        max_cache_hit_length: int,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], tuple[int, ...]]:
+        """Like find_longest_cache_hit but evaluates each group independently.
+
+        Returns:
+            (blocks_per_group, hit_lengths_per_group)
+        """
+
+        def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
+            if kv_cache_spec.block_size == self.hash_block_size:
+                return block_hashes
+            return BlockHashListWithBlockSize(
+                block_hashes, self.hash_block_size, kv_cache_spec.block_size
+            )
+
+        num_groups = len(self.kv_cache_config.kv_cache_groups)
+        hit_blocks: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
+        hit_lengths: list[int] = [0] * num_groups
+
+        for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
+            blocks = manager_cls.find_longest_cache_hit(
+                block_hashes=_get_block_hashes(spec),
+                max_length=max_cache_hit_length,
+                kv_cache_group_ids=group_ids,
+                block_pool=self.block_pool,
+                kv_cache_spec=spec,
+                drop_eagle_block=use_eagle,
+                alignment_tokens=self.scheduler_block_size,
+            )
+            group_hit = len(blocks[0]) * spec.block_size
+            for gid, blks in zip(group_ids, blocks):
+                hit_blocks[gid] = blks
+                hit_lengths[gid] = group_hit
+
+        return tuple(hit_blocks), tuple(hit_lengths)
 
 
 def get_kv_cache_coordinator(

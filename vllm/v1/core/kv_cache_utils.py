@@ -124,6 +124,9 @@ class KVCacheBlock:
     # The hash key (block hash + group id) of the block, only available
     # when the block is full and cached.
     _block_hash: BlockHashWithGroupId | None = None
+    # Number of prefix tokens covered by _block_hash. For full blocks this is
+    # the full block boundary; partial aliases can end inside a cache block.
+    _block_hash_num_tokens: int | None = None
 
     # Used to construct a doubly linked list for free blocks.
     # These two attributes should only be manipulated by FreeKVCacheBlockQueue.
@@ -137,16 +140,25 @@ class KVCacheBlock:
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
 
-    @block_hash.setter
-    def block_hash(self, block_hash: BlockHashWithGroupId):
-        assert self.block_hash is None, (
+    @property
+    def block_hash_num_tokens(self) -> int | None:
+        return self._block_hash_num_tokens
+
+    def set_block_hash(
+        self,
+        block_hash: BlockHashWithGroupId,
+        num_tokens: int | None = None,
+    ) -> None:
+        assert self.block_hash is None and self._block_hash_num_tokens is None, (
             "The block already has a hash. This should not happen."
         )
         self._block_hash = block_hash
+        self._block_hash_num_tokens = num_tokens
 
     def reset_hash(self):
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
+        self._block_hash_num_tokens = None
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
@@ -157,6 +169,7 @@ class KVCacheBlock:
             f"KVCacheBlock(block_id={self.block_id}, "
             f"ref_cnt={self.ref_cnt}, "
             f"_block_hash={self._block_hash!r}, "
+            f"_block_hash_num_tokens={self._block_hash_num_tokens}, "
             f"prev_free_block={prev_block_id}, "
             f"next_free_block={next_block_id})"
         )
@@ -657,18 +670,24 @@ def resolve_kv_cache_block_sizes(
 
 
 def get_request_block_hasher(
-    block_size: int,
+    hash_block_size: int,
     caching_hash_fn: Callable[[Any], bytes],
 ) -> Callable[[Request], list[BlockHash]]:
     """
     Returns a function which computes the list of un-computed block hashes
-    of a request."""
+    of a request.
+
+    Hashes are computed at ``hash_block_size`` granularity and chained over the
+    full prefix, so each hash uniquely fingerprints the prefix ending at its
+    boundary. Coarser group block sizes and partial-cache boundaries reuse
+    these hashes directly (see ``BlockHashListWithBlockSize``).
+    """
 
     def request_block_hasher(request: Request) -> list[BlockHash]:
-        start_token_idx = len(request.block_hashes) * block_size
+        start_token_idx = len(request.block_hashes) * hash_block_size
         num_tokens = request.num_tokens
 
-        if start_token_idx + block_size > num_tokens:
+        if start_token_idx + hash_block_size > num_tokens:
             # Early stop when there no new full blocks created.
             return []
 
@@ -685,7 +704,7 @@ def get_request_block_hasher(
         )
         new_block_hashes: list[BlockHash] = []
         while True:
-            end_token_idx = start_token_idx + block_size
+            end_token_idx = start_token_idx + hash_block_size
             if end_token_idx > num_tokens:
                 # We only hash full blocks
                 break
@@ -702,7 +721,7 @@ def get_request_block_hasher(
             )
 
             new_block_hashes.append(block_hash)
-            start_token_idx += block_size
+            start_token_idx += hash_block_size
             prev_block_hash_value = block_hash
 
         return new_block_hashes
@@ -947,7 +966,9 @@ def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
     return num_blocks
 
 
-def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
+def _pool_bytes_per_block(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> int:
     """
     Bytes consumed by one block in the worker's shared KV cache pool, mirroring
     the divisor used by `get_kv_cache_config_from_groups` to convert
@@ -958,9 +979,7 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
         return kv_cache_groups[0].kv_cache_spec.page_size_bytes
-    if all(
-        isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs) for g in kv_cache_groups
-    ):
+    if _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
         # buckets = {page_size: [[layer_names], [layer_names], ...]}
         buckets = _bucket_layers_by_page_size(kv_cache_groups)
         return sum(ps * len(slots) for ps, slots in buckets.items())
@@ -1051,9 +1070,14 @@ def unify_kv_cache_spec_page_size(
 ) -> dict[str, KVCacheSpec]:
     """
     Unify the page size of the given KVCacheSpec. If the page size of all layers
-    are the same, return the original KVCacheSpec. If not same, unify the page
-    size by increasing the block size of layers with smaller page size. Raise
-    NotImplementedError if failed to unify the page size.
+    are the same, return the original KVCacheSpec. If not same, first try to
+    unify page size by increasing the block size of layers with smaller page
+    size. If a smaller attention page does not evenly divide the maximum page
+    size, keep its logical block size and pad its physical page instead --- but
+    only for attention layers whose backend opts in via
+    ``AttentionSpec.indexes_kv_by_block_stride`` (the padded page is read through
+    a strided view, which not every backend handles). Raise NotImplementedError
+    if failed to unify the page size.
 
     Args:
         kv_cache_spec: The KVCacheSpec of each attention layer in the model
@@ -1273,16 +1297,39 @@ def _bucket_layers_by_page_size(
     return buckets
 
 
-def _get_kv_cache_config_deepseek_v4(
+def _use_packed_kv_cache_config(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> bool:
+    is_dsv4 = all(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for group in kv_cache_groups
+    )
+    kv_transfer_config = vllm_config.kv_transfer_config
+    extra_config = (
+        kv_transfer_config.kv_connector_extra_config
+        if kv_transfer_config is not None
+        else {}
+    )
+    # NOTE: enable_cross_layers_blocks is an experimental API and subject to change with
+    # https://github.com/vllm-project/vllm/issues/42082
+    enable_cross_layers = (
+        str(extra_config.get("enable_cross_layers_blocks", "False")).lower() == "true"
+    )
+    return is_dsv4 or (enable_cross_layers and len(kv_cache_groups) > 1)
+
+
+def _get_kv_cache_config_packed(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
 ) -> tuple[int, list[KVCacheTensor]]:
-    """DeepseekV4 KV cache tensor layout planning.
+    """Plan a packed per-block KV cache tensor layout.
 
     Emit one KVCacheTensor per (slot_idx, page_size). Layers from different
     groups at the same slot share a tensor (they have independent block
-    tables so block-id namespaces never collide).
+    tables so block-id namespaces never collide). Each emitted tensor aliases
+    one physical backing allocation, with per-block data laid out contiguously.
     """
     # buckets = {page_size: [[layer_names], [layer_names], ...]}
     buckets = _bucket_layers_by_page_size(kv_cache_groups)
@@ -1291,12 +1338,26 @@ def _get_kv_cache_config_deepseek_v4(
     num_blocks = available_memory // total_num_bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
+    total_size = total_num_bytes_per_block * num_blocks
+
     kv_cache_tensors: list[KVCacheTensor] = []
+    byte_offset = 0
     for ps, slots in buckets.items():
         for slot in slots:
-            kv_cache_tensors.append(KVCacheTensor(size=ps * num_blocks, shared_by=slot))
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=total_size,
+                    shared_by=slot,
+                    offset=byte_offset,
+                    block_stride=total_num_bytes_per_block,
+                )
+            )
+            byte_offset += ps
 
     return num_blocks, kv_cache_tensors
+
+
+_get_kv_cache_config_deepseek_v4 = _get_kv_cache_config_packed
 
 
 def get_kv_cache_config_from_groups(
@@ -1344,13 +1405,10 @@ def get_kv_cache_config_from_groups(
             )
             for layer_name in kv_cache_groups[0].layer_names
         ]
-    elif all(
-        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-        for group in kv_cache_groups
-    ):
-        # DeepseekV4: UniformTypeKVCacheSpecs but multiple groups.
-        # Delegate to the DeepseekV4-specific allocator.
-        num_blocks, kv_cache_tensors = _get_kv_cache_config_deepseek_v4(
+    elif _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
+        # DeepSeek V4 uses the packed layout by default. Other multi-group
+        # layouts can opt in with --enable-cross-layers.
+        num_blocks, kv_cache_tensors = _get_kv_cache_config_packed(
             vllm_config, kv_cache_groups, available_memory
         )
     else:
@@ -1895,36 +1953,17 @@ def generate_scheduler_kv_cache_config(
     return cfg
 
 
-def _report_kv_cache_config(
+def get_kv_cache_capacity(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
-) -> None:
+) -> tuple[int, float]:
     """
-    Log resolved KV cache configuration.
-
-    Args:
-        vllm_config: The global VllmConfig
-        kv_cache_config: The resolved KV cache configuration
+    Get the group-aware KV cache token capacity and max concurrency.
     """
     max_model_len = vllm_config.model_config.max_model_len
     max_concurrency = get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config
     )
-
-    # GPU KV cache size in tokens = max_concurrency * max_model_len: the total
-    # tokens of context the pool can hold at peak utilization. Sourcing this
-    # from the concurrency calculation handles hybrid layouts correctly: SWA /
-    # chunked-local groups have a per-request block count that's capped by
-    # their window, so a naive `num_blocks // num_groups * block_size` formula
-    # underestimates capacity for these models. DCP/PCP sharding is already
-    # accounted for in each spec's `max_memory_usage_bytes`.
-    num_tokens = int(max_concurrency * max_model_len)
-
-    logger.info_once("GPU KV cache size: %s tokens", f"{num_tokens:,}")
-    logger.info_once(
-        "Maximum concurrency for %s tokens per request: %.2fx",
-        f"{max_model_len:,}",
-        max_concurrency,
-    )
+    return int(max_concurrency * max_model_len), max_concurrency
 
 
 def _max_memory_usage_bytes_from_groups(
@@ -2216,7 +2255,7 @@ def get_kv_cache_configs(
             if not groups:
                 adjusted_memory.append(avail_mem)
                 continue
-            bytes_per_block = _pool_bytes_per_block(groups)
+            bytes_per_block = _pool_bytes_per_block(vllm_config, groups)
             logger.info(
                 "Overriding num_gpu_blocks=%d with num_gpu_blocks_override=%d",
                 avail_mem // bytes_per_block,
@@ -2299,7 +2338,18 @@ def get_kv_cache_configs(
                     tensor.size = tensor.size // old_nb * new_nb
 
             if len(kv_cache_config.kv_cache_groups) > 0:
-                _report_kv_cache_config(vllm_config, kv_cache_config)
+                max_model_len = vllm_config.model_config.max_model_len
+                num_tokens, max_concurrency = get_kv_cache_capacity(
+                    vllm_config, kv_cache_config
+                )
+                logger.info_once(
+                    "GPU KV cache size: %s tokens", f"{num_tokens:,}"
+                )
+                logger.info_once(
+                    "Maximum concurrency for %s tokens per request: %.2fx",
+                    f"{max_model_len:,}",
+                    max_concurrency,
+                )
     else:
         # Original single-pool logic
         min_num_blocks = min(
@@ -2315,7 +2365,18 @@ def get_kv_cache_configs(
                 tensor.size = tensor.size // num_blocks_old * min_num_blocks
 
             if len(kv_cache_config.kv_cache_groups) > 0:
-                _report_kv_cache_config(vllm_config, kv_cache_config)
+                max_model_len = vllm_config.model_config.max_model_len
+                num_tokens, max_concurrency = get_kv_cache_capacity(
+                    vllm_config, kv_cache_config
+                )
+                logger.info_once(
+                    "GPU KV cache size: %s tokens", f"{num_tokens:,}"
+                )
+                logger.info_once(
+                    "Maximum concurrency for %s tokens per request: %.2fx",
+                    f"{max_model_len:,}",
+                    max_concurrency,
+                )
 
     return kv_cache_configs
 
@@ -2329,11 +2390,14 @@ class BlockHashListWithBlockSize:
 
     Currently, only scaling up by an integer factor is supported (i.e.,
     `target_block_size` is a multiple of `hash_block_size`). Conversion is
-    performed lazily on access for efficiency, by concatenating consecutive
-    hashes at `hash_block_size` to form each hash at `target_block_size`.
+    performed lazily on access for efficiency. Each `hash_block_size` hash is
+    already chained over its entire prefix, so the hash at the last
+    `hash_block_size` boundary of a `target_block_size` block uniquely
+    fingerprints that block's prefix; we use it directly.
 
     Example (`hash_block_size` = 16, `target_block_size` = 32):
-    concatenating two 16-size hashes yields one 32-size hash:
+    the second 16-size hash already covers tokens 0-31, so it is the 32-size
+    hash:
 
     Block hashes with block_size 16:
     | Token Range | 0-15 | 16-31 | 32-47 | 48-63 |
@@ -2343,7 +2407,7 @@ class BlockHashListWithBlockSize:
     Block hashes with block_size 32:
     | Token Range | 0-31 | 32-63 |
     |-------------|------|-------|
-    | Hash        | AB   | CD    |
+    | Hash        | B    | D     |
 
     Args:
         block_hashes: Block hashes to convert, computed at `hash_block_size`.
@@ -2385,9 +2449,9 @@ class BlockHashListWithBlockSize:
             yield self._get_value_at(i)
 
     def _get_value_at(self, idx: int) -> BlockHash:
-        base = idx * self.scale_factor
-        end = base + self.scale_factor
-        return BlockHash(b"".join(self.block_hashes[base:end]))
+        # The last hash_block_size hash within the target block already chains
+        # over the whole prefix, so it is the target block's hash.
+        return self.block_hashes[(idx + 1) * self.scale_factor - 1]
 
 
 BlockHashList = list[BlockHash] | BlockHashListWithBlockSize
