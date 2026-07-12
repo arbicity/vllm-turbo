@@ -686,6 +686,9 @@ class EngineArgs:
     kv_cache_dtype_skip_layers: list[str] = get_field(
         CacheConfig, "kv_cache_dtype_skip_layers"
     )
+    kv_cache_dtype_skip_layers_dtype: str = (
+        CacheConfig.kv_cache_dtype_skip_layers_dtype
+    )
     mamba_cache_dtype: MambaDType = CacheConfig.mamba_cache_dtype
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
@@ -1158,7 +1161,18 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
         )
-        cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
+        # --kv-cache-dtype: use runtime validator so plugins (TQKV etc.)
+        # can register additional dtypes via register_cache_dtype(). The
+        # dataclass type alias is now ``str``, so argparse won't auto-
+        # populate choices; we pass the validator explicitly and drop the
+        # Literal-derived choices/metavar that get_kwargs would have added
+        # had the alias still been a Literal.
+        from vllm.config.cache import validate_cache_dtype as _validate_cdt
+        _kv_kwargs = cache_kwargs["cache_dtype"]
+        _kv_kwargs.pop("choices", None)
+        _kv_kwargs.pop("metavar", None)
+        _kv_kwargs["type"] = _validate_cdt
+        cache_group.add_argument("--kv-cache-dtype", **_kv_kwargs)
         cache_group.add_argument(
             "--num-gpu-blocks-override", **cache_kwargs["num_gpu_blocks_override"]
         )
@@ -1177,6 +1191,10 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-cache-dtype-skip-layers", **cache_kwargs["kv_cache_dtype_skip_layers"]
+        )
+        cache_group.add_argument(
+            "--kv-cache-dtype-skip-layers-dtype",
+            **cache_kwargs["kv_cache_dtype_skip_layers_dtype"],
         )
         cache_group.add_argument(
             "--kv-sharing-fast-prefill", **cache_kwargs["kv_sharing_fast_prefill"]
@@ -1884,6 +1902,8 @@ class EngineArgs:
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             calculate_kv_scales=self.calculate_kv_scales,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
+            kv_cache_dtype_skip_layers_dtype=(
+                self.kv_cache_dtype_skip_layers_dtype),
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,

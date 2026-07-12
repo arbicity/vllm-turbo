@@ -1001,6 +1001,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
+        # Backend-declared MLA spec class takes precedence. Plugin
+        # backends override get_kv_cache_spec_class("mla") to return
+        # their compressed-MLA spec; default falls through to stock
+        # MLAAttentionSpec.
+        custom_spec_cls = self.attn_backend.get_kv_cache_spec_class("mla")
+        if custom_spec_cls is not None:
+            return custom_spec_cls(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=1,
+                head_size=self.head_size,
+                dtype=kv_cache_dtype,
+                cache_dtype_str=vllm_config.cache_config.cache_dtype,
+            )
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
@@ -1999,6 +2012,16 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             kFp8Dynamic64Sym,
         )
 
+    def _get_gather_op(self):
+        """Return the gather/dequant op used by chunked-context prefill.
+
+        Default: vLLM's stock `ops.gather_and_maybe_dequant_cache`. Plugin
+        impls (e.g. TurboQuantMLAImpl) override this to provide a TQ-aware
+        gather that dequantizes their packed KV format on read. The op
+        signature must match `ops.gather_and_maybe_dequant_cache`.
+        """
+        return ops.gather_and_maybe_dequant_cache
+
     def __init__(
         self,
         num_heads: int,
@@ -2113,10 +2136,15 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         if use_fp8_prefill:
             q = q.to(prefill_metadata.q_data_type)
 
+        # Backend/impl-overridable gather op. Plugin impls (TQ-MLA, etc.)
+        # return their own gather-dequant function; default returns
+        # vLLM's stock custom op. Avoids the need for plugins to monkey-
+        # patch ops.gather_and_maybe_dequant_cache at module level.
+        gather_op = self._get_gather_op()
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
             if not use_fp8_prefill:
-                ops.gather_and_maybe_dequant_cache(
+                gather_op(
                     src_cache=kv_c_and_k_pe_cache,
                     dst=workspace,
                     block_table=prefill_metadata.block_table,

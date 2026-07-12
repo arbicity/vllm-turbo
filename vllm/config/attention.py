@@ -105,7 +105,10 @@ class AttentionConfig:
         if isinstance(value, str):
             if value.lower() == "auto":
                 return None
-            return AttentionBackendEnum[value.upper()]
+            # Allow hyphenated CLI form (e.g. "turbo-attn") to resolve to
+            # the underscored enum name (TURBO_ATTN). Backwards-compatible
+            # with existing all-uppercase / underscored values.
+            return AttentionBackendEnum[value.upper().replace("-", "_")]
         return value
 
     @field_validator("mla_prefill_backend", mode="before")

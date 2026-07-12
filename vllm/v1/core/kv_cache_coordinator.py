@@ -12,6 +12,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
     BlockHashListWithBlockSize,
     KVCacheBlock,
+    make_block_hash_with_group_id,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -58,6 +59,40 @@ def _validate_prefix_cache_retention_interval(
         )
 
 
+class _MultiGroupPoolView:
+    """Wraps per-group BlockPools to present a unified get_cached_block
+    interface for prefix caching lookups across groups with separate pools."""
+
+    def __init__(self, group_pools: dict[int, BlockPool]):
+        self.group_pools = group_pools
+        # Expose null_block from the first group's pool so callers that
+        # need a sentinel (e.g. MambaManager.find_longest_cache_hit at
+        # single_type_kv_cache_manager.py:820) get a valid KVCacheBlock.
+        # All pools' null_blocks are interchangeable for padding purposes.
+        self._null_block = next(iter(group_pools.values())).null_block
+
+    @property
+    def null_block(self) -> "KVCacheBlock":
+        return self._null_block
+
+    def get_cached_block(
+        self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+    ) -> list[KVCacheBlock] | None:
+        cached_blocks = []
+        for gid in kv_cache_group_ids:
+            pool = self.group_pools[gid]
+            block_hash_with_gid = make_block_hash_with_group_id(
+                block_hash, gid
+            )
+            block = pool.cached_block_hash_to_block.get_one_block(
+                block_hash_with_gid
+            )
+            if not block:
+                return None
+            cached_blocks.append(block)
+        return cached_blocks
+
+
 class KVCacheCoordinator(ABC):
     """
     Coordinate the KV cache of different KV cache groups.
@@ -88,13 +123,37 @@ class KVCacheCoordinator(ABC):
         )
         self.scheduler_block_size = scheduler_block_size
 
-        self.block_pool = BlockPool(
-            num_gpu_blocks=kv_cache_config.num_blocks,
-            enable_caching=enable_caching,
-            hash_block_size=hash_block_size,
-            enable_kv_cache_events=enable_kv_cache_events,
-            metrics_collector=metrics_collector,
-        )
+        per_group_nb = kv_cache_config.per_group_num_blocks
+        num_groups = len(kv_cache_config.kv_cache_groups)
+
+        if per_group_nb is not None:
+            assert len(per_group_nb) == num_groups
+            # Create per-group pools. Each group gets its own BlockPool
+            # so block IDs are independent per group.
+            self.group_pools: list[BlockPool] = [
+                BlockPool(
+                    nb,
+                    enable_caching,
+                    hash_block_size,
+                    enable_kv_cache_events,
+                    metrics_collector,
+                )
+                for nb in per_group_nb
+            ]
+            # Primary pool: the largest (attention) pool, used for usage
+            # reporting, events, and backward compatibility.
+            self.block_pool = max(
+                self.group_pools, key=lambda p: p.num_gpu_blocks
+            )
+        else:
+            self.block_pool = BlockPool(
+                kv_cache_config.num_blocks,
+                enable_caching,
+                hash_block_size,
+                enable_kv_cache_events,
+                metrics_collector,
+            )
+            self.group_pools = [self.block_pool] * num_groups
 
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {
@@ -109,7 +168,7 @@ class KVCacheCoordinator(ABC):
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 max_num_batched_tokens=max_num_batched_tokens,
                 max_model_len=max_model_len,
-                block_pool=self.block_pool,
+                block_pool=self.group_pools[i],
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size,
@@ -183,6 +242,62 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
         return num_blocks_to_allocate
+
+    def has_enough_blocks(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+        reserved_blocks: int = 0,
+        apply_admission_cap: bool = False,
+        watermark_blocks: int = 0,
+    ) -> bool:
+        """
+        Check if all per-group pools have enough free blocks for this request.
+
+        With per-group BlockPools, each manager's allocation must be checked
+        against its own pool. Returns True if all pools can accommodate.
+
+        ``reserved_blocks`` (added upstream in v0.23.0) is the number of free
+        blocks that must be left available; the allocation is only permitted if
+        it fits within (free blocks - reserved_blocks). Applied conservatively
+        per pool to preserve the single-pool upstream gating semantics.
+
+        ``apply_admission_cap`` mirrors ``get_num_blocks_to_allocate``: when
+        True (set only by the full-sequence admission gate) the per-manager
+        need applies the recycling-aware SWA/chunked-local cap; per-step
+        callers leave it False so the predictor matches ``allocate_new_blocks``.
+        This is the single per-pool-correct admission predicate shared by BOTH
+        the per-step path and the full-sequence gate, so they cannot drift.
+        """
+        for i, manager in enumerate(self.single_type_managers):
+            if isinstance(manager, CrossAttentionManager):
+                needed = manager.get_num_blocks_to_allocate(
+                    request_id,
+                    num_encoder_tokens,
+                    [],
+                    0,
+                    num_encoder_tokens,
+                    apply_admission_cap=apply_admission_cap,
+                )
+            else:
+                needed = manager.get_num_blocks_to_allocate(
+                    request_id,
+                    num_tokens,
+                    new_computed_blocks[i],
+                    total_computed_tokens,
+                    num_tokens_main_model,
+                    apply_admission_cap=apply_admission_cap,
+                )
+            available = self.group_pools[i].get_num_free_blocks() - reserved_blocks
+            # Apply the waiting/preempted watermark headroom per pool (upstream
+            # v0.24.0 added it to the single-pool required-vs-free comparison).
+            if needed + watermark_blocks > available:
+                return False
+        return True
 
     def allocate_new_computed_blocks(
         self,
@@ -697,11 +812,19 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     _max_length = min(
                         curr_hit_length + spec.block_size, max_cache_hit_length
                     )
+                # When groups have separate pools, create a view that
+                # dispatches get_cached_block to per-group pools.
+                if self.kv_cache_config.per_group_num_blocks is not None:
+                    pool_view = _MultiGroupPoolView(
+                        {gid: self.group_pools[gid] for gid in group_ids}
+                    )
+                else:
+                    pool_view = self.block_pool
                 hit_blocks = manager_cls.find_longest_cache_hit(
                     block_hashes=_get_block_hashes(spec),
                     max_length=_max_length,
                     kv_cache_group_ids=group_ids,
-                    block_pool=self.block_pool,
+                    block_pool=pool_view,
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self.scheduler_block_size,

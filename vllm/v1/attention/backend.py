@@ -165,12 +165,137 @@ class AttentionBackend(ABC):
         return dtype in cls.supported_dtypes
 
     @classmethod
+    def get_supported_kv_cache_dtypes(cls) -> list[str]:
+        """List of kv_cache_dtype names this backend accepts.
+
+        Default returns the static `supported_kv_cache_dtypes` ClassVar.
+        Override to compute dynamically — e.g. plugin backends that
+        register custom dtype names at import time can return
+        `[*cls.supported_kv_cache_dtypes, "my_custom_dtype"]` without
+        mutating the class attribute.
+        """
+        return list(cls.supported_kv_cache_dtypes)
+
+    @classmethod
+    def get_kv_cache_spec_class(cls, spec_kind: str = "full") -> type | None:
+        """KVCacheSpec subclass to use for this backend's layers, or None
+        to fall through to vLLM's default spec construction.
+
+        spec_kind: "full" | "sliding_window" | "mla". Plugin backends
+        with custom layouts (e.g. compressed KV) override this and
+        return their own spec class; the default of None means "I'm
+        fine with vLLM's stock spec."
+        """
+        return None
+
+    def get_gather_op(self):
+        """Custom replacement for vLLM's gather_and_maybe_dequant_cache
+        op, or None to use the default. Used by MLA backends that store
+        KV in a non-standard format and need a backend-aware gather.
+        """
+        return None
+
+    # ── Lifecycle hooks ───────────────────────────────────────────────────
+    # All three are optional classmethods with no-op defaults. vLLM calls
+    # them on the user-SELECTED backend (vllm_config.attention_config.backend),
+    # if any.
+    #
+    # Note: scheduler/compilation defaults (max_num_batched_tokens,
+    # cudagraph_mode, max_num_seqs, etc.) are deliberately NOT a backend
+    # hook. Those are user-facing config — backends document recommended
+    # values in their README and users set them via CLI flags. Silently
+    # mutating user config from a backend hook is the wrong abstraction.
+
+    @classmethod
+    def adjust_kv_budget(
+        cls,
+        profiled_bytes: int,
+        vllm_config,
+    ) -> int | None:
+        """Optionally adjust the profiler-derived KV budget. Called from
+        Worker.determine_available_memory just before returning.
+
+        Return a new bytes value, or None to accept the profiled budget.
+        Use case: compressed-KV backend on a hybrid model where the
+        profiler over-counts non-KV memory and underestimates the
+        available KV budget.
+        """
+        return None
+
+    @classmethod
+    def on_model_loaded(cls, worker, model) -> None:
+        """Called once per worker after Worker.load_model finishes.
+        Receives the worker and the loaded model module.
+
+        Use case: compressed-KV backend that wants to apply a one-time
+        weight transformation (e.g. fold a per-layer matrix into the
+        downstream Linear weight) without the worker holding a model
+        reference for the backend to capture.
+        """
+        pass
+
+    @classmethod
+    def on_kv_manager_created(cls, mgr) -> None:
+        """Called once per KVCacheManager construction. Receives the
+        manager instance.
+
+        Use case: compressed-KV backend with a cold-tier eviction
+        adapter that needs to register a pre-step callback on the
+        manager.
+        """
+        pass
+
+    @classmethod
+    def wraps_mla_backend(cls, base_mla_backend_cls):
+        """If this backend can wrap a stock MLA backend (e.g. compress
+        its shared-KV slot), return the wrapper class. Default: None
+        (don't wrap; standard MLA backend selection applies).
+
+        Consulted by the selector when:
+          - user passed --attention-backend selecting THIS backend
+          - the layer being constructed has use_mla=True
+
+        When this returns non-None for THIS backend class:
+          1. The selector falls through to standard MLA candidate
+             selection (ignoring the user's --attention-backend choice
+             for the MLA layer, since CUSTOM=this isn't an MLA backend).
+          2. The dtype gate is effectively lifted for that selection
+             (kv_cache_dtype is treated as "auto") — the wrapper
+             class is responsible for declaring the real supported
+             dtypes via get_supported_kv_cache_dtypes().
+          3. The picked MLA backend is then passed to wraps_mla_backend
+             and the returned wrapper is used.
+
+        Use case: a compressed-KV backend (TQKV) that wraps any of
+        TritonMLABackend / FlashAttnMLABackend / etc. with a
+        TurboQuantMLA wrapper.
+        """
+        return None
+
+    @staticmethod
+    def resolve_user_selected_backend(vllm_config) -> "type[AttentionBackend] | None":
+        """Resolve the user-selected attention backend class from
+        vllm_config.attention_config.backend (set by --attention-backend).
+
+        Returns None if no backend is selected or resolution fails.
+        Call sites firing the lifecycle/config hooks above use this to
+        find the right backend class to dispatch on.
+        """
+        attn_cfg = getattr(vllm_config, "attention_config", None)
+        backend_enum = getattr(attn_cfg, "backend", None) if attn_cfg else None
+        if backend_enum is None:
+            return None
+        try:
+            return backend_enum.get_class()
+        except (ValueError, ImportError):
+            return None
+
+    @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: "CacheDType | None") -> bool:
         if kv_cache_dtype is None:
             return True
-        return (not cls.supported_kv_cache_dtypes) or (
-            kv_cache_dtype in cls.supported_kv_cache_dtypes
-        )
+        supported = cls.get_supported_kv_cache_dtypes()
+        return (not supported) or (kv_cache_dtype in supported)
 
     @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:

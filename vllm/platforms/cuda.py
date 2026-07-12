@@ -142,7 +142,7 @@ def _get_backend_priorities(
             ]
     else:
         if device_capability.major == 10:
-            return [
+            backends = [
                 AttentionBackendEnum.FLASHINFER,
                 AttentionBackendEnum.FLASH_ATTN,
                 AttentionBackendEnum.TRITON_ATTN,
@@ -150,13 +150,21 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TURBOQUANT,
             ]
         else:
-            return [
+            backends = [
                 AttentionBackendEnum.FLASH_ATTN,
                 AttentionBackendEnum.FLASHINFER,
                 AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.FLEX_ATTENTION,
                 AttentionBackendEnum.TURBOQUANT,
             ]
+        # The turbo-attn plugin registers TURBO_ATTN for --kv-cache-dtype tqkv.
+        # Only a candidate once that plugin has registered it; it self-rejects
+        # via validate_configuration for every other kv-cache dtype. With the
+        # plugin absent the list is unchanged, so selection is identical for
+        # all other users.
+        if AttentionBackendEnum.TURBO_ATTN.is_overridden():
+            backends.append(AttentionBackendEnum.TURBO_ATTN)
+        return backends
 
 
 def _backend_cls_path(backend_cls: type[AttentionBackend]) -> str:
