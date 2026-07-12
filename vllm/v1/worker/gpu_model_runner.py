@@ -7200,7 +7200,7 @@ class GPUModelRunner(
                         or self.cache_config.cache_dtype
                     )
                     # Pass kv_cache_spec only to backends that accept it
-                    # (e.g. TQKV plugin for per-layer bit-width selection).
+                    # (e.g. TKV plugin for per-layer bit-width selection).
                     import inspect as _inspect
                     _shape_fn = attn_backend.get_kv_cache_shape
                     _shape_extra = (

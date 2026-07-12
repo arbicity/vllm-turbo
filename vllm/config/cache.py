@@ -44,7 +44,7 @@ _PLUGIN_CACHE_DTYPES: set[str] = set()
 # Kept as a type alias; argparse validation now goes through
 # validate_cache_dtype() which consults the runtime registry. The builtin
 # set above (incl. vLLM's native ``turboquant_*``) is the source of truth;
-# plugins (e.g. tqkv) add names at runtime via register_cache_dtype().
+# plugins (e.g. tkv) add names at runtime via register_cache_dtype().
 CacheDType = str
 
 

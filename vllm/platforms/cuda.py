@@ -157,7 +157,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLEX_ATTENTION,
                 AttentionBackendEnum.TURBOQUANT,
             ]
-        # The turbo-attn plugin registers TURBO_ATTN for --kv-cache-dtype tqkv.
+        # The turbo-attn plugin registers TURBO_ATTN for --kv-cache-dtype tkv.
         # Only a candidate once that plugin has registered it; it self-rejects
         # via validate_configuration for every other kv-cache dtype. With the
         # plugin absent the list is unchanged, so selection is identical for

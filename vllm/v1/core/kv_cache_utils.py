@@ -1107,7 +1107,7 @@ def unify_kv_cache_spec_page_size(
                     new_block_size = (max_page_size // per_token // 16) * 16
                     if new_block_size < 16:
                         new_block_size = 16
-                    # TQKV stores kv_cache as uint8 and uses .view(torch.int32)
+                    # TKV stores kv_cache as uint8 and uses .view(torch.int32)
                     # on it, which requires stride(1) = max_page_size //
                     # new_block_size to be divisible by 4. Reduce in steps of
                     # 16 until the constraint is met.
@@ -1115,7 +1115,7 @@ def unify_kv_cache_spec_page_size(
                         new_block_size -= 16
                         if new_block_size < 16:
                             raise NotImplementedError(
-                                f"Cannot find 4-aligned block_size for TQKV "
+                                f"Cannot find 4-aligned block_size for TKV "
                                 f"page unification: max_page_size="
                                 f"{max_page_size}, per_token={per_token}"
                             )
@@ -1465,7 +1465,7 @@ def get_kv_cache_config_from_groups(
             # tensors sized O(max_num_seqs * vocab_size), which the profiler
             # measured during its warmup but then freed before KV allocation.
             # When the sampler warmup runs again post-allocation, it needs
-            # fresh memory, and compressed KV backends (fp8, int8, tqkv, ...)
+            # fresh memory, and compressed KV backends (fp8, int8, tkv, ...)
             # tend to fill memory with near-zero rounding slack — so the
             # sampler OOMs unless we reserve explicit headroom.
             #
