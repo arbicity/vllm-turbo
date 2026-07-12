@@ -3,7 +3,7 @@
 """Tests for KVCacheManager.drain_request_blocks + pre-step callback.
 
 Verifies the scheduler-cooperative drain hook used by compressed-KV
-plugin backends (tqkv cold-tier). The safety contract: (1) req_to_blocks
+plugin backends (tkv cold-tier). The safety contract: (1) req_to_blocks
 slots are nulled BEFORE block_pool.free_blocks fires, so a subsequent
 allocate_slots cannot hand out the block while it is still referenced
 by the request's block_table; (2) freed blocks are immediately

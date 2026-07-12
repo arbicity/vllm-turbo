@@ -266,7 +266,7 @@ class AttentionBackend(ABC):
           3. The picked MLA backend is then passed to wraps_mla_backend
              and the returned wrapper is used.
 
-        Use case: a compressed-KV backend (TQKV) that wraps any of
+        Use case: a compressed-KV backend (TKV) that wraps any of
         TritonMLABackend / FlashAttnMLABackend / etc. with a
         TurboQuantMLA wrapper.
         """

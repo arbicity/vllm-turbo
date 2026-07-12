@@ -1,5 +1,5 @@
-# Notify turbo-attn to rebuild the vllm-tqkv engine image when this fork's
-# tqkv-seam overlay (main) changes. The image is built in turbo-attn (where
+# Notify turbo-attn to rebuild the vllm-tkv engine image when this fork's
+# tkv-seam overlay (main) changes. The image is built in turbo-attn (where
 # the Dockerfile + COPY overlay live), so we just fire a repository_dispatch.
 #
 # ── ONE-TIME SETUP ──────────────────────────────────────────────────────────

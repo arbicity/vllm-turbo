@@ -407,7 +407,7 @@ class KVCacheManager:
             # Per-group-pool admission gate. Upstream v0.23.0 compares a SUM of
             # blocks-to-allocate across all managers against ONLY self.block_pool
             # (the first/default pool) — correct for a single uniform pool, but
-            # wrong under the tqkv per-group split BlockPools (hybrid /
+            # wrong under the tkv per-group split BlockPools (hybrid /
             # compressed-KV): blocks are not fungible across a GDN-layer pool and
             # an attention-layer pool, so Σneed vs pool[0].free over/under-counts.
             # Route through coordinator.has_enough_blocks() — the same per-pool

@@ -20,7 +20,7 @@ logger = init_logger(__name__)
 current_platform.import_kernels()
 
 # SM_89 fp8 rowwise+colwise scaled GEMM fast path. The arbi-dev `gemm`
-# package (https://github.com/arbi-dev/tqkv) provides a single Triton kernel
+# package (https://github.com/arbi-dev/tkv) provides a single Triton kernel
 # with `tl.dot fp8` mma + in-register rowwise+colwise scaling that beats
 # vllm's CUTLASS visitor-tree path 1.04x-1.49x e2e decode tok/s on
 # Qwen3-0.6B and Qwen2.5-3B fp8-dynamic at RTX 4090.

@@ -1161,7 +1161,7 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
         )
-        # --kv-cache-dtype: use runtime validator so plugins (TQKV etc.)
+        # --kv-cache-dtype: use runtime validator so plugins (TKV etc.)
         # can register additional dtypes via register_cache_dtype(). The
         # dataclass type alias is now ``str``, so argparse won't auto-
         # populate choices; we pass the validator explicitly and drop the

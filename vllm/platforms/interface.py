@@ -774,11 +774,11 @@ class Platform:
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
 
-        # TQKV uses per-group BlockPool — attention and mamba live in
+        # TKV uses per-group BlockPool — attention and mamba live in
         # separate per-group pools each sized from its own spec. Forcing
         # attention block_size up to match mamba page size collapses
         # attention KV capacity by ~100x on hybrid models.
-        if str(cache_config.cache_dtype) == "tqkv":
+        if str(cache_config.cache_dtype) == "tkv":
             return
 
         if cache_config.cache_dtype == "auto":
@@ -835,7 +835,7 @@ class Platform:
                 attn_page_size_1_token = tq_page
         else:
             # Backend-declared spec class lets a compressed-KV plugin (e.g. the
-            # tqkv backend, dtype "tqkv") size its own page without monkey-
+            # tkv backend, dtype "tkv") size its own page without monkey-
             # patching; falls back to the stock FullAttentionSpec otherwise.
             # (vLLM-native turboquant_* is handled by the elif above.)
             spec_cls = backend_cls.get_kv_cache_spec_class("full")

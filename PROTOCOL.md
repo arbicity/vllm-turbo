@@ -12,7 +12,7 @@ protocol only takes effect when a plugin-registered CUSTOM backend opts in.
 
 This document is the architectural reference for upstream review. The
 reference consumer of these hooks is the TurboQuant KV-cache plugin
-(`tqkv`); the protocol contains no TurboQuant-specific knowledge.
+(`tkv`); the protocol contains no TurboQuant-specific knowledge.
 
 ---
 
@@ -64,7 +64,7 @@ These describe how the backend wants its KV pages laid out and managed.
 #### `get_supported_kv_cache_dtypes() -> Iterable[str] | None`
 
 Classmethod. Lets a backend declare which `--kv-cache-dtype` values it
-accepts (e.g. a compressed backend declares `"tqkv"`). Default `None`
+accepts (e.g. a compressed backend declares `"tkv"`). Default `None`
 means "accept whatever upstream already accepts."
 
 Consumed by the dtype validator in `Attention.__init__`, immediately
@@ -161,7 +161,7 @@ hundreds of LOC.
 
 ---
 
-## Per-problem mapping (TQKV reference consumer)
+## Per-problem mapping (TKV reference consumer)
 
 The TurboQuant plugin previously needed 15 monkey patches. Each one is
 consumed by exactly one of the 7 hooks above (some hooks subsume
@@ -169,9 +169,9 @@ multiple patches because they generalized the underlying need):
 
 | Old monkey patch                              | New protocol hook                  |
 |-----------------------------------------------|------------------------------------|
-| Add `"tqkv"` to allowed cache-dtype list      | `get_supported_kv_cache_dtypes`    |
-| Inject `TQKVAttentionSpec` for full-attn      | `get_kv_cache_spec_class("full_attention")` |
-| Inject `TQKVAttentionSpec` for sliding-window | `get_kv_cache_spec_class("sliding_window")` |
+| Add `"tkv"` to allowed cache-dtype list      | `get_supported_kv_cache_dtypes`    |
+| Inject `TKVAttentionSpec` for full-attn      | `get_kv_cache_spec_class("full_attention")` |
+| Inject `TKVAttentionSpec` for sliding-window | `get_kv_cache_spec_class("sliding_window")` |
 | Inject `TQMLAAttentionSpec` for MLA           | `get_kv_cache_spec_class("mla")`   |
 | Page-size override for compressed pages       | `KVCacheSpec.get_manager_class`    |
 | Manager-dispatch override                     | `KVCacheSpec.get_manager_class`    |
@@ -182,7 +182,7 @@ multiple patches because they generalized the underlying need):
 | Worker post-load model-ref stash              | `on_model_loaded`                  |
 | KV budget profiler fallback                   | `adjust_kv_budget`                 |
 | Cold-drain pre-step callback registration     | `on_kv_manager_created`            |
-| OOM-snapshot diagnostic install               | (out of scope — moved to plugin's `tqkv.debug`) |
+| OOM-snapshot diagnostic install               | (out of scope — moved to plugin's `tkv.debug`) |
 | Auto-config defaults                          | (out of scope — users now set flags explicitly) |
 
 The bottom two were moved out of upstream-touching code entirely; the
@@ -227,7 +227,7 @@ fast paths (FA4 cute rotary, fused custom kernel, ...) plug in via
    code.
 3. Run `pytest tests/v1/core/test_kv_drain_hook.py` to confirm the
    lifecycle hook still fires.
-4. Run a TQKV serve smoke (`vllm serve <model> --kv-cache-dtype tqkv
+4. Run a TKV serve smoke (`vllm serve <model> --kv-cache-dtype tkv
    --attention-backend custom`) — exercises every hook.
 5. Bump the base SHA pin in the consuming Docker overlay to the new
    upstream tip.
