@@ -902,6 +902,22 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         else:
             self.topk_indices_buffer = None
 
+        # Reserved top-k indices buffer shared by all sparse-attention indexer
+        # layers (mirrors DeepseekV4); the indexer writes its per-head decode/
+        # prefill block selection into it, the attend reads it back.
+        sparse_cfg = getattr(config, "sparse_attention_config", None)
+        if sparse_cfg is not None:
+            tp_size = get_tensor_model_parallel_world_size()
+            num_index_heads = max(1, sparse_cfg["sparse_num_index_heads"] // tp_size)
+            self.topk_indices_buffer = torch.empty(
+                num_index_heads,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                sparse_cfg["sparse_topk_blocks"],
+                dtype=torch.int32,
+            )
+        else:
+            self.topk_indices_buffer = None
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: MiniMaxM3DecoderLayer(
