@@ -43,10 +43,24 @@ def _warm_eagle_step_kernel(worker: "Worker", drafter) -> None:
     device = worker.device
     runner = worker.model_runner
     # n_blocks_per_req is a constexpr taken from the block table width;
-    # use a real block-table tensor so the specialization matches the
-    # serving call exactly.
+    # use the real block table of the KV-cache group the drafter runs
+    # against so the specialization matches the serving call exactly.
+    # (On hybrid models, group 0 can be a mamba/GDN group with a
+    # different width.)
     max_num_seqs = worker.scheduler_config.max_num_seqs
-    block_table = runner.input_batch.block_table[0].get_device_tensor(max_num_seqs)
+    kv_cache_gid = getattr(drafter, "kv_cache_gid", 0)
+    if kv_cache_gid < 0:
+        # Drafter did not bind a KV-cache group (e.g. -1 sentinel);
+        # warming an arbitrary group's width would compile the wrong
+        # specialization, so skip this kernel.
+        logger.warning(
+            "Drafter has no KV-cache group bound; skipping "
+            "eagle_step_slot_mapping_metadata_kernel warmup."
+        )
+        return
+    block_table = runner.input_batch.block_table[kv_cache_gid].get_device_tensor(
+        max_num_seqs
+    )
     for bs in _warm_batch_sizes(max_num_seqs):
         positions = torch.zeros(bs, dtype=torch.int64, device=device)
         seq_lens = torch.ones(bs, dtype=torch.int32, device=device)
