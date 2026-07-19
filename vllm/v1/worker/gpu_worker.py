@@ -280,6 +280,16 @@ class Worker(WorkerBase):
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+
+            # Root the CuTeDSL JIT compile cache in a boot-persistent
+            # directory before any kernel provider (e.g. the TURBO_ATTN
+            # plugin) compiles — the DSL's tmpdir default recompiles
+            # every kernel each boot (arbicity/arbi-serve#977).
+            from vllm.utils.cutedsl_cache import (
+                ensure_persistent_cutedsl_cache_dir,
+            )
+
+            ensure_persistent_cutedsl_cache_dir()
             parallel_config = self.parallel_config
             if (
                 parallel_config.distributed_executor_backend
