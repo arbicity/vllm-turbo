@@ -235,6 +235,20 @@ class AttentionBackend(ABC):
         pass
 
     @classmethod
+    def on_draft_model_loaded(cls, worker, draft_model) -> None:
+        """Called once per worker after Worker.load_model finishes, right
+        after on_model_loaded, when a model-based speculative-decode
+        drafter is configured. Receives the worker and the loaded DRAFT
+        model module (a separate nn.Module from the target model).
+
+        Use case: a backend applying per-layer weight transforms must
+        resolve draft-tower attention layers (e.g. ``mtp.layers.*``)
+        against the drafter's own module tree — they do not exist in the
+        target model passed to on_model_loaded.
+        """
+        pass
+
+    @classmethod
     def on_kv_manager_created(cls, mgr) -> None:
         """Called once per KVCacheManager construction. Receives the
         manager instance.

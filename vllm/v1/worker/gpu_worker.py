@@ -450,6 +450,14 @@ class Worker(WorkerBase):
             )
             if _backend_cls is not None:
                 _backend_cls.on_model_loaded(self, self.model_runner.model)
+                # Model-based drafters (MTP/Eagle/draft-model) are a separate
+                # nn.Module; backends folding weights per-layer must see its
+                # tree too (ngram-style proposers have no .model — skip).
+                _draft_model = getattr(
+                    getattr(self.model_runner, "drafter", None), "model", None
+                )
+                if _draft_model is not None:
+                    _backend_cls.on_draft_model_loaded(self, _draft_model)
         except Exception as _e:
             logger.warning("on_model_loaded hook failed: %s", _e)
 
