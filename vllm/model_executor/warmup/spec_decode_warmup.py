@@ -73,28 +73,31 @@ def _warm_eagle_padded_prep_kernels(worker: "Worker", num_spec_tokens: int) -> N
 
     device = worker.device
     vocab_size = worker.model_config.get_vocab_size()
-    num_sampled = num_spec_tokens + 1
     for bs in _warm_batch_sizes(worker.scheduler_config.max_num_seqs):
-        # prepare_next_token_ids_padded
-        sampled_token_ids = torch.zeros(
-            (bs, num_sampled), dtype=torch.int32, device=device
-        )
-        discard_mask = torch.zeros(bs, dtype=torch.bool, device=device)
-        backup_tokens = torch.zeros(bs, dtype=torch.int32, device=device)
-        next_token_ids = torch.empty(bs, dtype=torch.int32, device=device)
+        # prepare_next_token_ids_padded.  The first decode step after a
+        # prefill samples a single token (no draft yet), so
+        # sampled_token_ids is [bs, 1]; spec steps use [bs, K + 1].
+        # Both are distinct Triton specializations — warm each.
         valid_counts = torch.empty(bs, dtype=torch.int32, device=device)
-        eagle_prepare_next_token_padded_kernel[(bs,)](
-            sampled_token_ids,
-            discard_mask,
-            backup_tokens,
-            next_token_ids,
-            valid_counts,
-            vocab_size,
-            num_sampled,
-            bs,
-            sampled_token_ids.stride(0),
-            BLOCK_SIZE_TOKENS=next_power_of_2(num_sampled),
-        )
+        for num_sampled in (1, num_spec_tokens + 1):
+            sampled_token_ids = torch.zeros(
+                (bs, num_sampled), dtype=torch.int32, device=device
+            )
+            discard_mask = torch.zeros(bs, dtype=torch.bool, device=device)
+            backup_tokens = torch.zeros(bs, dtype=torch.int32, device=device)
+            next_token_ids = torch.empty(bs, dtype=torch.int32, device=device)
+            eagle_prepare_next_token_padded_kernel[(bs,)](
+                sampled_token_ids,
+                discard_mask,
+                backup_tokens,
+                next_token_ids,
+                valid_counts,
+                vocab_size,
+                num_sampled,
+                bs,
+                sampled_token_ids.stride(0),
+                BLOCK_SIZE_TOKENS=next_power_of_2(num_sampled),
+            )
 
         # prepare_inputs_padded
         cu_num_draft = (

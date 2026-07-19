@@ -946,6 +946,16 @@ class Worker(WorkerBase):
 
             trigger_inductor_lazy_init(self.device)
 
+        # Re-run the spec-decode prep-kernel warmup after CUDA-graph
+        # capture: idempotent (in-memory Triton cache hits when the
+        # pre-capture pass already compiled everything), and catches any
+        # specialization the capture phase disturbed.
+        from vllm.model_executor.warmup.spec_decode_warmup import (
+            spec_decode_prep_kernel_warmup,
+        )
+
+        spec_decode_prep_kernel_warmup(self)
+
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
         from vllm.utils.jit_monitor import activate as activate_jit_monitor
