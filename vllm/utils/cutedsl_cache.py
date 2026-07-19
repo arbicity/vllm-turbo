@@ -28,7 +28,9 @@ The DSL re-reads ``CUTE_DSL_CACHE_DIR`` on every cache access
 if ``cutlass`` was already imported.
 """
 
+import functools
 import glob
+import inspect
 import os
 
 from vllm.logger import init_logger
@@ -36,6 +38,8 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 CUTEDSL_CACHE_DIR_ENV = "CUTE_DSL_CACHE_DIR"
+
+_compile_only_cache_patched = False
 
 
 def _default_cutedsl_cache_dir() -> str:
@@ -88,4 +92,83 @@ def ensure_persistent_cutedsl_cache_dir() -> None:
         "CuTeDSL compile cache dir: %s (%d cached kernels present)",
         cache_dir,
         cutedsl_cache_artifact_count(),
+    )
+
+
+# Parameters generate_mlir must expose, in order, for the compile-only
+# cache override below to be applicable.  If the installed cutlass DSL
+# diverges, we refuse to patch (fail loud, run stock) instead of
+# guessing.
+_GENERATE_MLIR_EXPECTED_PARAMS = (
+    "self",
+    "funcBody",
+    "function_name",
+    "gpu_module_attrs",
+    "args",
+    "kwonlyargs",
+    "sig",
+    "pipeline",
+    "no_cache",
+    "no_jit_engine",
+    "compile_only",
+)
+
+
+def enable_cutedsl_compile_only_cache() -> None:
+    """Let explicit ``cute.compile`` calls use the DSL's own file cache.
+
+    ``cute.compile`` (``CompileCallable._compile``) hard-sets
+    ``compile_only=True, no_cache=True``, so the DSL's content-addressed
+    on-disk compile cache never applies to explicitly compiled kernels —
+    every boot re-runs the full MLIR pipeline + cubin generation for ops
+    like the TURBO_ATTN ``ArbiAttentionForward`` prefill kernel.
+
+    The underlying machinery (``BaseDSL.generate_mlir`` ->
+    ``compile_and_cache``) fully supports caching compile-only results:
+    on a hit it loads the lowered module (embedded cubin) from disk,
+    CRC32-checked and keyed by IR-content + DSL envars (GPU arch) + DSL
+    version, and only rebuilds the host-side execution engine.  This
+    wrapper re-enables that path by flipping the forced ``no_cache`` for
+    compile-only invocations.  Signature-guarded against DSL drift:
+    on mismatch we log and leave stock behavior (per-boot recompile).
+
+    Idempotent; call before the first ``cute.compile``.
+    """
+    global _compile_only_cache_patched
+    if _compile_only_cache_patched:
+        return
+
+    try:
+        from cutlass.base_dsl.dsl import BaseDSL
+    except Exception:
+        logger.debug("cutlass DSL not importable; no compile cache to enable.")
+        return
+
+    original = BaseDSL.generate_mlir
+    try:
+        sig = inspect.signature(original)
+        params = tuple(sig.parameters)
+    except (TypeError, ValueError):
+        params = ()
+    if params[: len(_GENERATE_MLIR_EXPECTED_PARAMS)] != _GENERATE_MLIR_EXPECTED_PARAMS:
+        logger.warning(
+            "cutlass BaseDSL.generate_mlir signature changed (%s); NOT "
+            "enabling the compile-only CuTeDSL cache — explicit "
+            "cute.compile kernels will re-JIT every boot.",
+            params,
+        )
+        return
+
+    @functools.wraps(original)
+    def generate_mlir_with_persistent_cache(self, *args, **kwargs):
+        bound = sig.bind(self, *args, **kwargs)
+        if bound.arguments.get("compile_only") and bound.arguments.get("no_cache"):
+            bound.arguments["no_cache"] = False
+        return original(*bound.args, **bound.kwargs)
+
+    BaseDSL.generate_mlir = generate_mlir_with_persistent_cache
+    _compile_only_cache_patched = True
+    logger.info_once(
+        "Enabled the CuTeDSL on-disk compile cache for explicit "
+        "cute.compile calls (compile-only no_cache override)."
     )

@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 from vllm.logger import init_logger
 from vllm.utils.cutedsl_cache import (
     cutedsl_cache_artifact_count,
+    enable_cutedsl_compile_only_cache,
     ensure_persistent_cutedsl_cache_dir,
 )
 
@@ -70,8 +71,9 @@ def turbo_attn_prefill_warmup(worker: "Worker") -> None:
         return
 
     # Belt-and-braces: make sure the compiles below land in the
-    # persistent cache even if the worker-init call was skipped.
+    # persistent cache even if the worker-init calls were skipped.
     ensure_persistent_cutedsl_cache_dir()
+    enable_cutedsl_compile_only_cache()
 
     max_tokens = min(
         worker.scheduler_config.max_num_batched_tokens, runner.max_num_tokens

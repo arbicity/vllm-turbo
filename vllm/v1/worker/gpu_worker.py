@@ -286,10 +286,19 @@ class Worker(WorkerBase):
             # plugin) compiles — the DSL's tmpdir default recompiles
             # every kernel each boot (arbicity/arbi-serve#977).
             from vllm.utils.cutedsl_cache import (
+                enable_cutedsl_compile_only_cache,
                 ensure_persistent_cutedsl_cache_dir,
             )
 
             ensure_persistent_cutedsl_cache_dir()
+            # Explicit cute.compile calls bypass the DSL cache by
+            # default; re-enable it when a CuTeDSL-compiling attention
+            # plugin (TURBO_ATTN) is registered.  Gated to avoid paying
+            # the cutlass import in deployments that never compile.
+            from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+            if AttentionBackendEnum.TURBO_ATTN.is_overridden():
+                enable_cutedsl_compile_only_cache()
             parallel_config = self.parallel_config
             if (
                 parallel_config.distributed_executor_backend
@@ -435,7 +444,10 @@ class Worker(WorkerBase):
         # into a downstream Linear) once the model is fully loaded.
         try:
             from vllm.v1.attention.backend import AttentionBackend
-            _backend_cls = AttentionBackend.resolve_user_selected_backend(self.vllm_config)
+
+            _backend_cls = AttentionBackend.resolve_user_selected_backend(
+                self.vllm_config
+            )
             if _backend_cls is not None:
                 _backend_cls.on_model_loaded(self, self.model_runner.model)
         except Exception as _e:
@@ -607,10 +619,14 @@ class Worker(WorkerBase):
         # taken out of the backend-adjusted budget.
         try:
             from vllm.v1.attention.backend import AttentionBackend
-            _backend_cls = AttentionBackend.resolve_user_selected_backend(self.vllm_config)
+
+            _backend_cls = AttentionBackend.resolve_user_selected_backend(
+                self.vllm_config
+            )
             if _backend_cls is not None:
                 _adjusted = _backend_cls.adjust_kv_budget(
-                    int(self.available_kv_cache_memory_bytes), self.vllm_config,
+                    int(self.available_kv_cache_memory_bytes),
+                    self.vllm_config,
                 )
                 if _adjusted is not None and _adjusted > 0:
                     self.available_kv_cache_memory_bytes = _adjusted
@@ -769,8 +785,12 @@ class Worker(WorkerBase):
         try:
             from vllm.v1.attention.backend import AttentionBackend
 
-            _backend_cls = AttentionBackend.resolve_user_selected_backend(self.vllm_config)
-            if _backend_cls is not None and hasattr(_backend_cls, "on_kv_cache_initialized"):
+            _backend_cls = AttentionBackend.resolve_user_selected_backend(
+                self.vllm_config
+            )
+            if _backend_cls is not None and hasattr(
+                _backend_cls, "on_kv_cache_initialized"
+            ):
                 _backend_cls.on_kv_cache_initialized(self)
         except Exception as _e:
             logger.warning("on_kv_cache_initialized hook failed: %s", _e)
