@@ -29,6 +29,10 @@ from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
     sparse_mla_triton_warmup_if_needed,
 )
+from vllm.model_executor.warmup.spec_decode_warmup import (
+    spec_decode_prep_kernel_warmup,
+)
+from vllm.model_executor.warmup.turbo_attn_warmup import turbo_attn_prefill_warmup
 from vllm.model_executor.warmup.v1_block_table_warmup import (
     warm_v1_block_table_kernels,
 )
@@ -125,6 +129,15 @@ def kernel_warmup(worker: "Worker"):
             force_attention=True,
             create_mixed_batch=True,
         )
+
+    # TURBO_ATTN (tkv) prefill attention: pre-compile the CuTeDSL prefill
+    # kernels for the served shape buckets so the first prefill wave after
+    # boot does not stall on an in-inference JIT (arbicity/arbi-serve#977).
+    turbo_attn_prefill_warmup(worker)
+
+    # Spec-decode input-prep Triton kernels (padded EAGLE/MTP path +
+    # rejection-sampler expand) that no dummy run reaches otherwise.
+    spec_decode_prep_kernel_warmup(worker)
 
     if worker.vllm_config.kernel_config.enable_cutedsl_warmup:
         cutedsl_warmup()
