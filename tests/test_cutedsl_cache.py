@@ -1,9 +1,49 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
-from pathlib import Path
+"""The #9 cache tests, now run against the shimmed module.
 
-from vllm.utils import cutedsl_cache
+vllm.utils.cutedsl_cache is a thin re-export of the canonical
+tkv.kernels.cute_dsl_cache (turbo-attn); the behavioral tests below
+exercise the shim's public surface end-to-end, and the wrapper's own
+unit tests (signature-drift refusal, fake-DSL flip) live with the
+implementation in turbo-attn (tests/test_cutedsl_cache.py there).
+"""
+
+import os
+import sys
+from pathlib import Path
+from types import ModuleType
+
+import pytest
+
+_impl = pytest.importorskip(
+    "tkv.kernels.cute_dsl_cache",
+    reason="shim behavioral tests need the canonical tkv implementation",
+)
+
+from vllm.utils import cutedsl_cache  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _reset_impl_state(monkeypatch):
+    # Module state lives in the tkv implementation, not the shim.
+    monkeypatch.setattr(_impl, "_cache_dir_logged", False)
+    monkeypatch.setattr(_impl, "_compile_only_cache_patched", False)
+
+
+def test_shim_reexports_canonical_impl():
+    assert cutedsl_cache.CUTEDSL_CACHE_DIR_ENV == _impl.CUTEDSL_CACHE_DIR_ENV
+    assert (
+        cutedsl_cache.cutedsl_cache_artifact_count is _impl.cutedsl_cache_artifact_count
+    )
+    assert (
+        cutedsl_cache.ensure_persistent_cutedsl_cache_dir
+        is _impl.ensure_persistent_cutedsl_cache_dir
+    )
+    assert (
+        cutedsl_cache.enable_cutedsl_compile_only_cache
+        is _impl.enable_cutedsl_compile_only_cache
+    )
 
 
 def test_operator_set_cache_dir_wins(monkeypatch, tmp_path):
@@ -67,9 +107,6 @@ def test_artifact_count_missing_dir(monkeypatch, tmp_path):
 
 
 def _install_fake_cutlass(monkeypatch, generate_mlir):
-    import sys
-    from types import ModuleType
-
     cutlass = ModuleType("cutlass")
     base_dsl = ModuleType("cutlass.base_dsl")
     dsl_mod = ModuleType("cutlass.base_dsl.dsl")
@@ -87,12 +124,7 @@ def _install_fake_cutlass(monkeypatch, generate_mlir):
     return BaseDSL
 
 
-def _reset_patch_state(monkeypatch):
-    monkeypatch.setattr(cutedsl_cache, "_compile_only_cache_patched", False)
-
-
 def test_compile_only_cache_flips_no_cache(monkeypatch):
-    _reset_patch_state(monkeypatch)
     seen = {}
 
     def generate_mlir(
@@ -131,8 +163,6 @@ def test_compile_only_cache_flips_no_cache(monkeypatch):
 
 
 def test_compile_only_cache_refuses_unknown_signature(monkeypatch):
-    _reset_patch_state(monkeypatch)
-
     def generate_mlir(self, something_else):
         return "ok"
 
@@ -143,8 +173,6 @@ def test_compile_only_cache_refuses_unknown_signature(monkeypatch):
 
 
 def test_compile_only_cache_idempotent(monkeypatch):
-    _reset_patch_state(monkeypatch)
-
     def generate_mlir(
         self,
         funcBody,
