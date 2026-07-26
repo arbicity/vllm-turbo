@@ -298,6 +298,25 @@ class Worker(WorkerBase):
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+
+            # Root the CuTeDSL JIT compile cache in a boot-persistent
+            # directory before any kernel provider (e.g. the TURBO_ATTN
+            # plugin) compiles — the DSL's tmpdir default recompiles
+            # every kernel each boot (arbicity/arbi-serve#977).
+            from vllm.utils.cutedsl_cache import (
+                enable_cutedsl_compile_only_cache,
+                ensure_persistent_cutedsl_cache_dir,
+            )
+
+            ensure_persistent_cutedsl_cache_dir()
+            # Explicit cute.compile calls bypass the DSL cache by
+            # default; re-enable it when a CuTeDSL-compiling attention
+            # plugin (TURBO_ATTN) is registered.  Gated to avoid paying
+            # the cutlass import in deployments that never compile.
+            from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+            if AttentionBackendEnum.TURBO_ATTN.is_overridden():
+                enable_cutedsl_compile_only_cache()
             parallel_config = self.parallel_config
             if (
                 parallel_config.distributed_executor_backend
@@ -437,6 +456,28 @@ class Worker(WorkerBase):
                 self.device,
                 self.model_runner.get_model(),
             )
+
+        # Backend lifecycle hook: lets the user-selected attention backend
+        # apply one-time weight transforms (e.g. fold a per-layer matrix
+        # into a downstream Linear) once the model is fully loaded.
+        try:
+            from vllm.v1.attention.backend import AttentionBackend
+
+            _backend_cls = AttentionBackend.resolve_user_selected_backend(
+                self.vllm_config
+            )
+            if _backend_cls is not None:
+                _backend_cls.on_model_loaded(self, self.model_runner.model)
+                # Model-based drafters (MTP/Eagle/draft-model) are a separate
+                # nn.Module; backends folding weights per-layer must see its
+                # tree too (ngram-style proposers have no .model — skip).
+                _draft_model = getattr(
+                    getattr(self.model_runner, "drafter", None), "model", None
+                )
+                if _draft_model is not None:
+                    _backend_cls.on_draft_model_loaded(self, _draft_model)
+        except Exception as _e:
+            logger.warning("on_model_loaded hook failed: %s", _e)
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
@@ -601,6 +642,27 @@ class Worker(WorkerBase):
                     suggested_util,
                 )
 
+        # Backend KV-budget hook: lets the user-selected backend adjust
+        # the profiler-derived budget (e.g. compressed-KV backend on a
+        # hybrid model whose profiler over-counts non-KV memory). Runs
+        # BEFORE the multimodal IPC reservation so the mm carve-out is
+        # taken out of the backend-adjusted budget.
+        try:
+            from vllm.v1.attention.backend import AttentionBackend
+
+            _backend_cls = AttentionBackend.resolve_user_selected_backend(
+                self.vllm_config
+            )
+            if _backend_cls is not None:
+                _adjusted = _backend_cls.adjust_kv_budget(
+                    int(self.available_kv_cache_memory_bytes),
+                    self.vllm_config,
+                )
+                if _adjusted is not None and _adjusted > 0:
+                    self.available_kv_cache_memory_bytes = _adjusted
+        except Exception as _e:
+            logger.warning("adjust_kv_budget hook failed: %s", _e)
+
         return self._reserve_mm_ipc_gpu_memory(
             int(self.available_kv_cache_memory_bytes)
         )
@@ -744,6 +806,25 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        # Backend lifecycle hook: KV cache is allocated (initialize_kv_cache
+        # ran in initialize_from_config) but CUDA-graph capture has NOT
+        # started yet — the eager, pre-capture window a compressed-KV
+        # backend needs to warm any per-(k_bw,v_bw) decode autotune so a
+        # smart-mix bundle doesn't re-sweep lazily during capture. No-op
+        # for backends that don't define the hook.
+        try:
+            from vllm.v1.attention.backend import AttentionBackend
+
+            _backend_cls = AttentionBackend.resolve_user_selected_backend(
+                self.vllm_config
+            )
+            if _backend_cls is not None and hasattr(
+                _backend_cls, "on_kv_cache_initialized"
+            ):
+                _backend_cls.on_kv_cache_initialized(self)
+        except Exception as _e:
+            logger.warning("on_kv_cache_initialized hook failed: %s", _e)
+
         warmup_sizes: list[int] = []
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
@@ -896,6 +977,16 @@ class Worker(WorkerBase):
             )
 
             trigger_inductor_lazy_init(self.device)
+
+        # Re-run the spec-decode prep-kernel warmup after CUDA-graph
+        # capture: idempotent (in-memory Triton cache hits when the
+        # pre-capture pass already compiled everything), and catches any
+        # specialization the capture phase disturbed.
+        from vllm.model_executor.warmup.spec_decode_warmup import (
+            spec_decode_prep_kernel_warmup,
+        )
+
+        spec_decode_prep_kernel_warmup(self)
 
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.

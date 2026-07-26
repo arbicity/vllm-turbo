@@ -146,7 +146,7 @@ def _get_backend_priorities(
         # cutlass path (used for dflash attention) is known to have problems.
         # So prefer FlashAttention when non-causal on SM100f.
         if device_capability.major == 10 and not use_non_causal:
-            return [
+            backends = [
                 AttentionBackendEnum.FLASHINFER,
                 AttentionBackendEnum.FLASH_ATTN,
                 AttentionBackendEnum.TRITON_ATTN,
@@ -154,13 +154,21 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TURBOQUANT,
             ]
         else:
-            return [
+            backends = [
                 AttentionBackendEnum.FLASH_ATTN,
                 AttentionBackendEnum.FLASHINFER,
                 AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.FLEX_ATTENTION,
                 AttentionBackendEnum.TURBOQUANT,
             ]
+        # The turbo-attn plugin registers TURBO_ATTN for --kv-cache-dtype tkv.
+        # Only a candidate once that plugin has registered it; it self-rejects
+        # via validate_configuration for every other kv-cache dtype. With the
+        # plugin absent the list is unchanged, so selection is identical for
+        # all other users.
+        if AttentionBackendEnum.TURBO_ATTN.is_overridden():
+            backends.append(AttentionBackendEnum.TURBO_ATTN)
+        return backends
 
 
 def _backend_cls_path(backend_cls: type[AttentionBackend]) -> str:
