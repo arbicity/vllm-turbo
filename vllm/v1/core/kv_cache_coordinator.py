@@ -255,6 +255,7 @@ class KVCacheCoordinator(ABC):
         new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
         num_encoder_tokens: int,
         total_computed_tokens: int,
+        num_local_computed_tokens: int,
         num_tokens_main_model: int,
         reserved_blocks: int = 0,
         apply_admission_cap: bool = False,
@@ -265,6 +266,10 @@ class KVCacheCoordinator(ABC):
 
         With per-group BlockPools, each manager's allocation must be checked
         against its own pool. Returns True if all pools can accommodate.
+
+        ``num_local_computed_tokens`` is threaded through to each manager's
+        ``get_num_blocks_to_allocate`` (v0.26.0 added it to that signature) so
+        the per-pool need matches the coordinator's own allocation predictor.
 
         ``reserved_blocks`` (added upstream in v0.23.0) is the number of free
         blocks that must be left available; the allocation is only permitted if
@@ -285,6 +290,7 @@ class KVCacheCoordinator(ABC):
                     num_encoder_tokens,
                     [],
                     0,
+                    0,
                     num_encoder_tokens,
                     apply_admission_cap=apply_admission_cap,
                 )
@@ -294,6 +300,7 @@ class KVCacheCoordinator(ABC):
                     num_tokens,
                     new_computed_blocks[i],
                     total_computed_tokens,
+                    num_local_computed_tokens,
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
                 )
