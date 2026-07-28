@@ -74,6 +74,25 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     return KVQuantMode.NONE
 
 
+def kv_cache_dtype_is_backend_managed(kv_cache_dtype: str) -> bool:
+    """True when the ATTENTION BACKEND owns this dtype string end-to-end.
+
+    Such a dtype is quantized, but its layout is not modelled by
+    :class:`KVQuantMode` — the backend parses the preset name itself. It must
+    therefore reach the backend VERBATIM and must never be downgraded to
+    ``"auto"`` by the skip-layer logic, which assumes ``KVQuantMode.NONE``
+    means "this layer is unquantized".
+
+    Upstream TurboQuant is exactly this case: ``get_kv_quant_mode()`` has no
+    ``turboquant_*`` branch, so every preset mapped to ``NONE``, the callers
+    substituted ``"auto"``, and ``TurboQuantConfig.from_cache_dtype()`` then
+    raised ``ValueError: Unknown TurboQuant cache dtype: 'auto'``. The
+    substitution happens at THREE independent sites, which is why patching one
+    of them (by hand, in an image) appeared to fix it and kept regressing.
+    """
+    return isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant")
+
+
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
     return get_kv_quant_mode(kv_cache_dtype) != KVQuantMode.NONE
 

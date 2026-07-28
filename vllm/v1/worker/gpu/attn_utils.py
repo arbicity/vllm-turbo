@@ -22,6 +22,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import (
+    kv_cache_dtype_is_backend_managed,
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
@@ -313,6 +314,7 @@ def _reshape_kv_cache(
                     "auto"
                     if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
                     and not isinstance(kv_cache_spec, TQFullAttentionSpec)
+                    and not kv_cache_dtype_is_backend_managed(cache_dtype)
                     else cache_dtype
                 )
                 kv_cache_shape = group.backend.get_kv_cache_shape(
@@ -479,6 +481,7 @@ def _update_hybrid_attention_layout(
             "auto"
             if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
             and not isinstance(kv_cache_spec, TQFullAttentionSpec)
+            and not kv_cache_dtype_is_backend_managed(cache_dtype)
             else cache_dtype
         )
         block_dim = group.backend.get_kv_cache_block_dim(
