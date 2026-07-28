@@ -128,7 +128,6 @@ from vllm.utils.torch_utils import (
     current_stream,
     get_dtype_size,
     is_quantized_kv_cache,
-    kv_cache_dtype_is_backend_managed,
     kv_cache_dtype_str_to_dtype,
 )
 from vllm.v1.attention.backend import (
@@ -163,6 +162,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVCacheSpecKind,
     KVQuantMode,
+    kv_cache_dtype_is_backend_managed,
     MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
