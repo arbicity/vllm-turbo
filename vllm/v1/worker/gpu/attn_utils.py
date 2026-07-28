@@ -22,7 +22,6 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import (
-    kv_cache_dtype_is_backend_managed,
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
@@ -30,6 +29,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
+    kv_cache_dtype_is_backend_managed,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import (
