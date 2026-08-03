@@ -95,6 +95,40 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
+def _backends_in_use(worker) -> list[type]:
+    """Attention backend classes the engine ACTUALLY resolved, de-duplicated.
+
+    ``AttentionBackend.resolve_user_selected_backend`` reads
+    ``vllm_config.attention_config.backend``, which only ``--attention-backend``
+    populates. A backend chosen by auto-derivation (e.g. tkv via
+    ``--kv-cache-dtype tkv``) resolves to ``None``, so every lifecycle hook
+    below was skipped for it — silently, since nothing raised and the guarding
+    ``if`` simply did not take.
+
+    Measured 2026-08-03: with ``on_kv_cache_initialized`` skipped, a
+    compressed-KV backend never got its pre-capture warm-up window and ran its
+    whole decode autotune inside the FIRST request — "41 (batch, bucket) cells
+    swept in 207.53s" — past the client timeout, on an idle box.
+
+    ``model_runner.attn_groups[*].backend`` is the class in use regardless of
+    how it was selected. Falls back to the user-selected enum when no groups
+    exist yet (this is also called before KV-cache init).
+    """
+    seen: list[type] = []
+    for groups in getattr(worker.model_runner, "attn_groups", []) or []:
+        for g in groups:
+            cls = getattr(g, "backend", None)
+            if cls is not None and cls not in seen:
+                seen.append(cls)
+    if not seen:
+        from vllm.v1.attention.backend import AttentionBackend
+
+        sel = AttentionBackend.resolve_user_selected_backend(worker.vllm_config)
+        if sel is not None:
+            seen.append(sel)
+    return seen
+
+
 class AsyncIntermediateTensors(IntermediateTensors):
     """IntermediateTensors with lazy comm synchronization"""
 
@@ -461,12 +495,8 @@ class Worker(WorkerBase):
         # apply one-time weight transforms (e.g. fold a per-layer matrix
         # into a downstream Linear) once the model is fully loaded.
         try:
-            from vllm.v1.attention.backend import AttentionBackend
-
-            _backend_cls = AttentionBackend.resolve_user_selected_backend(
-                self.vllm_config
-            )
-            if _backend_cls is not None:
+            _backends = _backends_in_use(self)
+            for _backend_cls in _backends:
                 _backend_cls.on_model_loaded(self, self.model_runner.model)
                 # Model-based drafters (MTP/Eagle/draft-model) are a separate
                 # nn.Module; backends folding weights per-layer must see its
@@ -648,18 +678,16 @@ class Worker(WorkerBase):
         # BEFORE the multimodal IPC reservation so the mm carve-out is
         # taken out of the backend-adjusted budget.
         try:
-            from vllm.v1.attention.backend import AttentionBackend
-
-            _backend_cls = AttentionBackend.resolve_user_selected_backend(
-                self.vllm_config
-            )
-            if _backend_cls is not None:
+            # First adjustment wins: the budget is a single number, and
+            # applying several in sequence would compound them.
+            for _backend_cls in _backends_in_use(self):
                 _adjusted = _backend_cls.adjust_kv_budget(
                     int(self.available_kv_cache_memory_bytes),
                     self.vllm_config,
                 )
                 if _adjusted is not None and _adjusted > 0:
                     self.available_kv_cache_memory_bytes = _adjusted
+                    break
         except Exception as _e:
             logger.warning("adjust_kv_budget hook failed: %s", _e)
 
@@ -813,15 +841,10 @@ class Worker(WorkerBase):
         # smart-mix bundle doesn't re-sweep lazily during capture. No-op
         # for backends that don't define the hook.
         try:
-            from vllm.v1.attention.backend import AttentionBackend
-
-            _backend_cls = AttentionBackend.resolve_user_selected_backend(
-                self.vllm_config
-            )
-            if _backend_cls is not None and hasattr(
-                _backend_cls, "on_kv_cache_initialized"
-            ):
-                _backend_cls.on_kv_cache_initialized(self)
+            _backends = _backends_in_use(self)
+            for _backend_cls in _backends:
+                if hasattr(_backend_cls, "on_kv_cache_initialized"):
+                    _backend_cls.on_kv_cache_initialized(self)
         except Exception as _e:
             logger.warning("on_kv_cache_initialized hook failed: %s", _e)
 
