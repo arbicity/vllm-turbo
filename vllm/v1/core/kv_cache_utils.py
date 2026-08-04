@@ -934,6 +934,34 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
     return True
 
 
+def get_tensor_slots(group: KVCacheGroupSpec) -> list[list[str]]:
+    """Split a group's layers into the tensors they actually need.
+
+    Normally one tensor per layer. When the group's spec fuses layers into
+    one shared page (`aggregated_layer_count` > 1 — the page already SUMS
+    those layers' per-layer pages, which occupy disjoint byte slices of it)
+    each tensor is shared by that many consecutive layers. Layers in a group
+    share one block table, so slicing a shared page by layer keeps every
+    layer's bytes disjoint within a block.
+
+    Returns a list of layer-name lists, one per tensor to allocate.
+    """
+    names = group.layer_names
+    agg = group.kv_cache_spec.aggregated_layer_count
+    if agg <= 1:
+        return [[name] for name in names]
+    assert len(names) % agg == 0, (
+        f"group of {len(names)} layers is not divisible by its spec's "
+        f"aggregated_layer_count={agg}; the fused page would not tile the group"
+    )
+    return [names[i : i + agg] for i in range(0, len(names), agg)]
+
+
+def num_tensor_slots(group: KVCacheGroupSpec) -> int:
+    """Number of KV cache tensors `group` needs. See `get_tensor_slots`."""
+    return len(get_tensor_slots(group))
+
+
 def get_max_concurrency_for_kv_cache_config(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> float:
@@ -961,7 +989,7 @@ def get_max_concurrency_for_kv_cache_config(
             return min(token_scaling)
 
     num_layer_per_group = max(
-        len(group.layer_names) for group in kv_cache_config.kv_cache_groups
+        num_tensor_slots(group) for group in kv_cache_config.kv_cache_groups
     )
     max_memory_usage_per_request = num_layer_per_group * max_memory_usage_bytes(
         vllm_config, (group.kv_cache_spec for group in kv_cache_config.kv_cache_groups)
@@ -1002,7 +1030,7 @@ def _pool_bytes_per_block(
         # buckets = {page_size: [[layer_names], [layer_names], ...]}
         buckets = _bucket_layers_by_page_size(kv_cache_groups)
         return sum(ps * len(slots) for ps, slots in buckets.items())
-    group_size = max(len(g.layer_names) for g in kv_cache_groups)
+    group_size = max(num_tensor_slots(g) for g in kv_cache_groups)
     page_size = get_uniform_page_size([g.kv_cache_spec for g in kv_cache_groups])
     return page_size * group_size
 
@@ -1444,7 +1472,10 @@ def get_kv_cache_config_from_groups(
         # mode) get a fixed-size allocation based on max_num_seqs, freeing
         # the remaining memory for O(n) groups (attention) to maximize
         # KV cache token capacity.
-        group_size = max(len(group.layer_names) for group in kv_cache_groups)
+        # Tensor slots, not layers: a group whose spec fuses layers into one
+        # shared page needs one tensor per fused set (see `get_tensor_slots`).
+        group_slots = {id(group): get_tensor_slots(group) for group in kv_cache_groups}
+        group_size = max(len(slots) for slots in group_slots.values())
         assert group_size > 0, "group_size must be greater than 0"
 
         # Separate O(1) groups (mamba) from O(n) groups (attention)
@@ -1480,7 +1511,7 @@ def get_kv_cache_config_from_groups(
             # allocation loop below (for i in range(group_size)
             # × for group in o1_groups).
             mamba_per_slot = sum(
-                len(g.layer_names) * g.kv_cache_spec.page_size_bytes
+                len(group_slots[id(g)]) * g.kv_cache_spec.page_size_bytes
                 for g in o1_groups
             )
             mamba_memory = mamba_per_slot * mamba_blocks
@@ -1517,7 +1548,7 @@ def get_kv_cache_config_from_groups(
                 g.kv_cache_spec.page_size_bytes for g in on_groups
             )
             attn_group_size = max(
-                len(g.layer_names) for g in on_groups
+                len(group_slots[id(g)]) for g in on_groups
             ) if on_groups else 1
             num_blocks = int(
                 attn_memory // attn_per_slot // attn_group_size
@@ -1537,18 +1568,20 @@ def get_kv_cache_config_from_groups(
             kv_cache_tensors = []
             for i in range(group_size):
                 for group in on_groups:
-                    if i < len(group.layer_names):
+                    slots = group_slots[id(group)]
+                    if i < len(slots):
                         kv_cache_tensors.append(KVCacheTensor(
                             size=group.kv_cache_spec.page_size_bytes
                                  * num_blocks,
-                            shared_by=[group.layer_names[i]],
+                            shared_by=slots[i],
                         ))
                 for group in o1_groups:
-                    if i < len(group.layer_names):
+                    slots = group_slots[id(group)]
+                    if i < len(slots):
                         kv_cache_tensors.append(KVCacheTensor(
                             size=group.kv_cache_spec.page_size_bytes
                                  * mamba_blocks,
-                            shared_by=[group.layer_names[i]],
+                            shared_by=slots[i],
                         ))
         else:
             # No split needed — all groups are O(n). Use the original
@@ -1564,8 +1597,9 @@ def get_kv_cache_config_from_groups(
             for i in range(group_size):
                 shared_by = []
                 for j in range(len(kv_cache_groups)):
-                    if i < len(kv_cache_groups[j].layer_names):
-                        shared_by.append(kv_cache_groups[j].layer_names[i])
+                    slots = group_slots[id(kv_cache_groups[j])]
+                    if i < len(slots):
+                        shared_by.extend(slots[i])
                 kv_cache_tensors.append(
                     KVCacheTensor(
                         size=page_size * num_blocks, shared_by=shared_by
@@ -2050,7 +2084,7 @@ def _max_memory_usage_bytes_from_groups(
     # General case: sum max memory across all groups.
     # For uniform-page hybrids: group_size * page_size * blocks_needed.
     # For split hybrids (O(1) mamba + O(n) attention): sum per-group.
-    group_size = max(len(group.layer_names) for group in kv_cache_groups)
+    group_size = max(num_tensor_slots(group) for group in kv_cache_groups)
     page_sizes = set(g.kv_cache_spec.page_size_bytes for g in kv_cache_groups)
     if len(page_sizes) == 1:
         page_size = page_sizes.pop()
@@ -2062,7 +2096,7 @@ def _max_memory_usage_bytes_from_groups(
     else:
         # Non-uniform pages: sum each group's max usage independently
         return sum(
-            len(g.layer_names)
+            num_tensor_slots(g)
             * g.kv_cache_spec.max_memory_usage_bytes(vllm_config)
             for g in kv_cache_groups
         )
