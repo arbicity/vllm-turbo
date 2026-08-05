@@ -138,6 +138,23 @@ class KVCacheSpec:
     def storage_block_size(self) -> int:
         return self.block_size
 
+    @property
+    def aggregated_layer_count(self) -> int:
+        """How many model layers this spec's `page_size_bytes` already covers.
+
+        Default 1: a page holds one layer's tokens, so a group of N layers
+        needs N tensors and N * page_size_bytes per block.
+
+        A spec may instead FUSE several layers into one shared page — the
+        layers occupy disjoint byte slices of the same page, and
+        `page_size_bytes` is the SUM of their per-layer pages. Such a spec
+        returns the number of layers fused, and a group of N layers then
+        needs N / aggregated_layer_count tensors. Sizing that group per
+        layer would charge the summed page once per layer and cut usable
+        KV capacity by this factor.
+        """
+        return 1
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         """
         The maximum possible memory usage of this KV cache in bytes.
