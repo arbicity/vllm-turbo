@@ -790,9 +790,8 @@ class Platform:
         parallel_config = vllm_config.parallel_config
 
         # TKV uses per-group BlockPool — attention and mamba live in
-        # separate per-group pools each sized from its own spec. Forcing
-        # attention block_size up to match mamba page size collapses
-        # attention KV capacity by ~100x on hybrid models.
+        # separate per-group pools each sized from its own spec, so raising
+        # attention block_size to cover the mamba page size does not apply.
         #
         # Prefix, not equality: every tkv-family dtype ("tkv", "tkv-bypass")
         # serves through the same backend and the same per-group pool.

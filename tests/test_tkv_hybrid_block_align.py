@@ -2,10 +2,8 @@
 """Every tkv-family cache dtype must skip hybrid block-size alignment.
 
 The alignment raises attention ``block_size`` to cover the mamba page size.
-TKV sizes attention and mamba from separate per-group pools, so applying it
-collapses attention KV capacity by ~100x. The guard was an equality test on
-``"tkv"``, which let ``"tkv-bypass"`` fall through and serve at block 832
-while ``"tkv"`` served at 32.
+TKV sizes attention and mamba from separate per-group pools, so the alignment
+does not apply to any dtype in the family.
 """
 
 from types import SimpleNamespace
