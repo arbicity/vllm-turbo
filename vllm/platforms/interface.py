@@ -793,7 +793,10 @@ class Platform:
         # separate per-group pools each sized from its own spec. Forcing
         # attention block_size up to match mamba page size collapses
         # attention KV capacity by ~100x on hybrid models.
-        if str(cache_config.cache_dtype) == "tkv":
+        #
+        # Prefix, not equality: every tkv-family dtype ("tkv", "tkv-bypass")
+        # serves through the same backend and the same per-group pool.
+        if str(cache_config.cache_dtype).startswith("tkv"):
             return
 
         if cache_config.cache_dtype == "auto":
