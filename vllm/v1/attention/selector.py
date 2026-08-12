@@ -173,6 +173,60 @@ def get_attn_backend(
     )
 
 
+def _mla_wrapper_cls(backend) -> "type[AttentionBackend] | None":
+    """Return ``backend``'s class if it can wrap an MLA backend, else None.
+
+    Wrapper-capable means the class overrode ``wraps_mla_backend``; the
+    default on ``AttentionBackend`` is a no-op that every backend
+    inherits, so identity against it is what distinguishes a real
+    wrapper from an ordinary backend.
+
+    Args:
+        backend: An ``AttentionBackendEnum`` member.
+
+    Returns:
+        The backend class, or None if it is unimportable or not a wrapper.
+    """
+    try:
+        cls = backend.get_class()
+    except (ValueError, ImportError):
+        return None
+    wraps_fn = getattr(cls, "wraps_mla_backend", None)
+    base_fn = getattr(AttentionBackend, "wraps_mla_backend", None)
+    if wraps_fn is None or base_fn is None:
+        return None
+    if getattr(wraps_fn, "__func__", wraps_fn) is getattr(base_fn, "__func__", base_fn):
+        return None
+    return cls
+
+
+def _mla_wrapper_for_dtype(
+    kv_cache_dtype: "CacheDType | None",
+) -> "type[AttentionBackend] | None":
+    """Find a plugin-registered MLA wrapper backend supporting a KV dtype.
+
+    Only plugin-registered backends are considered, so with no plugin
+    loaded the candidate set is empty and MLA selection is unchanged.
+
+    Args:
+        kv_cache_dtype: The requested KV cache dtype.
+
+    Returns:
+        The wrapper backend class, or None when no plugin claims the dtype.
+    """
+    if kv_cache_dtype is None or kv_cache_dtype == "auto":
+        return None
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    for backend in AttentionBackendEnum:
+        if not backend.is_overridden():
+            continue
+        cls = _mla_wrapper_cls(backend)
+        if cls is not None and cls.supports_kv_cache_dtype(kv_cache_dtype):
+            return cls
+    return None
+
+
 @cache
 def _cached_get_attn_backend(
     backend,
@@ -190,25 +244,17 @@ def _cached_get_attn_backend(
     # wrapper class is what supports the user's compressed dtype, not
     # the picked base MLA backend.
     user_selected_backend_cls = None
-    if backend is not None and attn_selector_config.use_mla:
-        try:
-            _maybe_user_cls = backend.get_class()
-        except (ValueError, ImportError):
-            _maybe_user_cls = None
-        if _maybe_user_cls is not None:
-            _user_wraps_fn = getattr(
-                _maybe_user_cls, "wraps_mla_backend", None,
+    if attn_selector_config.use_mla:
+        if backend is not None:
+            user_selected_backend_cls = _mla_wrapper_cls(backend)
+        else:
+            # No --attention-backend: the MLA candidate list holds only
+            # true MLA backends, none of which advertise a plugin
+            # kv-cache dtype, so a compressed dtype would find no
+            # candidate at all. Resolve the wrapper from the dtype.
+            user_selected_backend_cls = _mla_wrapper_for_dtype(
+                attn_selector_config.kv_cache_dtype
             )
-            _base_wraps_fn = getattr(AttentionBackend, "wraps_mla_backend", None)
-            # Only treat as wrapper-capable if the backend overrode the
-            # default no-op (avoids matching every backend).
-            if (
-                _user_wraps_fn is not None
-                and _base_wraps_fn is not None
-                and getattr(_user_wraps_fn, "__func__", _user_wraps_fn)
-                is not getattr(_base_wraps_fn, "__func__", _base_wraps_fn)
-            ):
-                user_selected_backend_cls = _maybe_user_cls
 
     if user_selected_backend_cls is not None:
         # Fall through to standard MLA selection without the user's
