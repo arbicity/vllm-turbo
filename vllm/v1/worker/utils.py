@@ -121,6 +121,18 @@ class KVBlockZeroer:
         self._ids_pinned: list[torch.Tensor] = []
         self._ids_gpu: list[torch.Tensor] = []
         self._id_buffer_index = 0
+        # Ground-truth real block count for the FullAttentionSpec tensors
+        # this zeroer actually targets, read directly off each tensor's own
+        # block-dim shape (not any caller-supplied/aggregate figure). Hybrid
+        # (attention + Mamba) models can legitimately profile to a
+        # per-group block count of 0 for the attention group specifically
+        # (e.g. at a low gpu_memory_utilization where the Mamba SSM-state
+        # groups consume the whole budget) while a global/aggregate
+        # "num_blocks" elsewhere still reports a large number from the
+        # other groups. min() across every tensor this zeroer touches keeps
+        # this correct even if a future caller mixes groups of different
+        # real capacity into one zeroer.
+        self.real_num_blocks: int | None = None
 
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
@@ -149,6 +161,9 @@ class KVBlockZeroer:
                 kv = static_forward_context[layer_name].kv_cache
                 if not isinstance(kv, torch.Tensor):
                     continue
+                n_blocks_this_tensor = int(kv.shape[block_dim])
+                if self.real_num_blocks is None or n_blocks_this_tensor < self.real_num_blocks:
+                    self.real_num_blocks = n_blocks_this_tensor
                 dp = kv.data_ptr()
                 if dp in seen_ptrs:
                     continue

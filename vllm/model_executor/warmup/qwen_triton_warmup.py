@@ -174,7 +174,44 @@ def _warm_zero_kv_blocks_with_runner_zeroer(runner: object) -> bool:
     if not callable(zero_block_ids):
         return False
 
+    # _ZERO_KV_N_BLOCKS assumes the real KV cache pool has at least
+    # max(_ZERO_KV_N_BLOCKS) physical blocks. At a small enough
+    # (gpu_memory_utilization, max_model_len) the pool can legitimately be
+    # allocated with as few as 0 blocks for the FullAttentionSpec group
+    # specifically (verified live on a hybrid attention+Mamba model: the
+    # Mamba SSM-state groups can consume the entire memory budget, leaving
+    # the attention group's own KV tensors truly zero-sized). Zeroing an
+    # unclamped range(n_blocks) then requests block ids that were never
+    # allocated, and the Triton kernel computes a byte offset from them and
+    # writes past the real tensor -- a genuine out-of-bounds write,
+    # reproduced live as a CUDA illegal memory access in vLLM's Triton
+    # runtime (not a race/ordering issue: the kernel is correctly
+    # stream-ordered after the id upload, the ids themselves are simply out
+    # of range).
+    #
+    # runner.kv_cache_config.num_blocks is NOT a safe clamp source here: on
+    # a hybrid model it is an aggregate/global figure that does not track
+    # any specific KV-cache group's real capacity, so it can (and did, live)
+    # report a large count (e.g. from the Mamba groups) even while the
+    # attention group this zeroer actually targets has 0 real blocks --
+    # clamping against it does not prevent the out-of-bounds write.
+    # zeroer.real_num_blocks is ground truth instead: it's read directly off
+    # the actual allocated KV cache tensors' own block-dim shape when the
+    # zeroer was built (see KVBlockZeroer.__init__ in
+    # vllm/v1/worker/utils.py), so it always reflects what's really there
+    # for the tensors this zeroer will write into.
+    #
+    # n_blocks is a plain runtime int here (not a tl.constexpr on
+    # _zero_kv_blocks_kernel), so clamping it changes only the grid size of
+    # an already-compiled kernel, not what gets JIT'd -- no warmup coverage
+    # is lost by shrinking a shape that doesn't fit.
+    real_num_blocks = getattr(zeroer, "real_num_blocks", None)
+
     for n_blocks in _ZERO_KV_N_BLOCKS:
+        if real_num_blocks is not None:
+            n_blocks = min(n_blocks, real_num_blocks)
+        if n_blocks <= 0:
+            continue
         zero_block_ids(list(range(n_blocks)))
     return True
 
