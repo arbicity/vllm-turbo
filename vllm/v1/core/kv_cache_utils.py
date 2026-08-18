@@ -1117,13 +1117,15 @@ def unify_kv_cache_spec_page_size(
     Unify the page size of the given KVCacheSpec. If the page size of all layers
     are the same, return the original KVCacheSpec. If not same, unify the page
     size by increasing the block size of layers with smaller page size. Two
-    cases cannot be unified by block size alone and pad their physical page to
-    the maximum instead: Mamba layers, whose page size comes from state shapes
-    and is independent of block size; and attention layers whose page does not
-    evenly divide the maximum and whose backend opts in via
-    ``AttentionSpec.indexes_kv_by_block_stride`` (the padded page is read through
-    a strided view, which not every backend handles). Raise NotImplementedError
-    if failed to unify the page size.
+    cases cannot be unified by an integer block-size ratio: Mamba layers, whose
+    page size comes from state shapes and is independent of block size, pad
+    their physical page to the maximum; and attention layers whose page does
+    not evenly divide the maximum pad it too, which needs a backend that opts
+    in via ``AttentionSpec.indexes_kv_by_block_stride`` (the padded page is
+    read through a strided view, which not every backend handles). When a Mamba
+    page sets the maximum, such an attention layer first takes the largest
+    block size whose tokens still fit that page. Raise NotImplementedError if
+    failed to unify the page size.
 
     Args:
         kv_cache_spec: The KVCacheSpec of each attention layer in the model
@@ -1137,6 +1139,17 @@ def unify_kv_cache_spec_page_size(
         return kv_cache_spec
 
     max_page_size = max(page_sizes)
+    # A Mamba page is fixed by its state shapes: it is arbitrarily large
+    # relative to an attention page and rarely a multiple of one, so an
+    # attention layer unifying up to it can neither scale its block size by an
+    # integer ratio nor afford to pad at its own block size (a 32KB page inside
+    # a 1MB one wastes ~97% of the attention budget). It instead takes the
+    # largest block size whose tokens fit. Attention-vs-attention mismatches
+    # keep the stricter scale-or-pad-or-raise path below.
+    mamba_sets_max_page = any(
+        isinstance(spec, MambaSpec) and spec.page_size_bytes == max_page_size
+        for spec in kv_cache_spec.values()
+    )
     new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
         if layer_spec.page_size_bytes == max_page_size:
@@ -1157,29 +1170,31 @@ def unify_kv_cache_spec_page_size(
                 ratio = max_page_size // layer_page_size
                 new_block_size = layer_spec.block_size * ratio
                 new_spec = replace(layer_spec, block_size=new_block_size)
-            elif (
-                isinstance(layer_spec, AttentionSpec)
-                and layer_spec.indexes_kv_by_block_stride
-            ):
-                new_block_size = _fill_padded_page_block_size(
-                    layer_spec, max_page_size
+            else:
+                new_block_size = (
+                    _fill_padded_page_block_size(layer_spec, max_page_size)
+                    if mamba_sets_max_page
+                    else None
                 )
-                if new_block_size is None:
-                    new_spec = replace(layer_spec, page_size_padded=max_page_size)
-                else:
+                if new_block_size is not None:
                     new_spec = replace(
                         layer_spec,
                         block_size=new_block_size,
                         page_size_padded=max_page_size,
                     )
-            else:
-                raise NotImplementedError(
-                    f"Layer {layer_name}: page size is not divisible by the "
-                    "maximum page size and cannot be padded. Padding is only "
-                    "supported for attention layers whose backend indexes KV "
-                    "pages by the block stride (indexes_kv_by_block_stride is "
-                    "True)."
-                )
+                elif (
+                    isinstance(layer_spec, AttentionSpec)
+                    and layer_spec.indexes_kv_by_block_stride
+                ):
+                    new_spec = replace(layer_spec, page_size_padded=max_page_size)
+                else:
+                    raise NotImplementedError(
+                        f"Layer {layer_name}: page size is not divisible by "
+                        "the maximum page size and cannot be padded. Padding "
+                        "is only supported for attention layers whose backend "
+                        "indexes KV pages by the block stride "
+                        "(indexes_kv_by_block_stride is True)."
+                    )
             assert new_spec.page_size_bytes == max_page_size
             new_kv_cache_spec[layer_name] = new_spec
     return new_kv_cache_spec
@@ -1192,6 +1207,10 @@ def _fill_padded_page_block_size(
 
     Returned sizes are multiples of 16 and keep ``max_page_size //
     block_size`` divisible by 4, so a uint8 page stays viewable as int32.
+
+    None when no size strictly larger than the spec's own qualifies: the
+    layer would then hold its original tokens in a padded page, which is the
+    plain padding that ``indexes_kv_by_block_stride`` gates.
     """
     per_token = layer_spec.page_size_bytes // layer_spec.block_size
     if per_token <= 0:
@@ -1199,7 +1218,9 @@ def _fill_padded_page_block_size(
     block_size = (max_page_size // per_token // 16) * 16
     while block_size >= 16 and (max_page_size // block_size) % 4 != 0:
         block_size -= 16
-    if block_size < 16 or block_size * per_token > max_page_size:
+    if block_size <= layer_spec.block_size or block_size < 16:
+        return None
+    if block_size * per_token > max_page_size:
         return None
     return block_size
 
