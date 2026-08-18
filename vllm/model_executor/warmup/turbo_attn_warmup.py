@@ -46,7 +46,11 @@ def _turbo_attn_backend_class():
         return None
     try:
         return AttentionBackendEnum.TURBO_ATTN.get_class()
-    except Exception:
+    except (ImportError, ValueError):
+        # A registered-but-unresolvable override is a broken plugin
+        # install. Attention backend selection reports it for real; here
+        # it only means there are no TURBO_ATTN kernels to pre-compile.
+        logger.exception("TURBO_ATTN is registered but its class does not load.")
         return None
 
 

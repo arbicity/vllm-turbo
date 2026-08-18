@@ -204,16 +204,19 @@ class KVCacheManager:
         # Backend lifecycle hook: lets the user-selected attention backend
         # register pre-step callbacks or other manager-side state. Used
         # by compressed-KV backends with a cold-tier eviction adapter.
-        try:
-            from vllm.config import get_current_vllm_config
-            from vllm.v1.attention.backend import AttentionBackend
-            _vllm_cfg = get_current_vllm_config()
+        # A manager built outside a set_current_vllm_config() scope (unit
+        # tests, standalone block-pool harnesses) has no backend to
+        # dispatch on, so there is no hook to run. The hook call itself is
+        # not guarded: a backend that fails to register its manager-side
+        # state must not reach the scheduler pretending it did.
+        from vllm.config import get_current_vllm_config_or_none
+        from vllm.v1.attention.backend import AttentionBackend
+
+        _vllm_cfg = get_current_vllm_config_or_none()
+        if _vllm_cfg is not None:
             _backend_cls = AttentionBackend.resolve_user_selected_backend(_vllm_cfg)
             if _backend_cls is not None:
                 _backend_cls.on_kv_manager_created(self)
-        except Exception:
-            # Hook is advisory; never fatal during manager construction.
-            pass
 
     @property
     def usage(self) -> float:
@@ -928,12 +931,17 @@ class KVCacheManager:
     def new_step_starts(self) -> None:
         """Called when a new step is started. Pre-step callbacks fire
         BEFORE coordinator bookkeeping so any block_pool free they issue
-        is visible to this step's allocate_slots()."""
+        is visible to this step's allocate_slots().
+
+        A callback that raises propagates. A backend registers one to
+        reclaim blocks the scheduler is about to allocate from; a
+        swallowed failure leaks those blocks every step until the pool
+        starves, so the engine surfaces the failure instead of running
+        degraded. A backend that tolerates its own callback failing
+        catches that inside the callback.
+        """
         for cb in self._pre_step_callbacks:
-            try:
-                cb(self)
-            except Exception:
-                logger.exception("Pre-step KV callback %r raised.", cb)
+            cb(self)
         self.coordinator.new_step_starts()
 
     def register_pre_step_callback(

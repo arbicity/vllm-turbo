@@ -177,15 +177,43 @@ def test_pre_step_callback_idempotent_registration():
     assert len(calls) == 1
 
 
-def test_pre_step_callback_exception_does_not_break_scheduling():
-    """A raising callback is logged but must not abort new_step_starts
-    or prevent coordinator.new_step_starts from running."""
+def test_pre_step_callback_exception_propagates():
+    """A raising callback aborts the step instead of leaking the blocks
+    it was registered to reclaim. Coordinator bookkeeping does not run
+    past a reclaim that failed."""
     wrapper, _stm, _pool = _make_mgr()
+
     def bad(mgr):
         raise RuntimeError("boom")
+
     wrapper.register_pre_step_callback(bad)
-    wrapper.new_step_starts()  # must not raise
-    assert wrapper.coordinator.new_step_count == 1
+    with pytest.raises(RuntimeError, match="boom"):
+        wrapper.new_step_starts()
+    assert wrapper.coordinator.new_step_count == 0
+
+
+def test_pre_step_callbacks_before_a_failure_still_ran():
+    """Callbacks fire in registration order; the first to raise stops
+    the step, and the ones already run keep their effect."""
+    wrapper, _stm, _pool = _make_mgr()
+    fired: list[str] = []
+
+    def first(mgr):
+        fired.append("first")
+
+    def second(mgr):
+        fired.append("second")
+        raise RuntimeError("boom")
+
+    def third(mgr):
+        fired.append("third")
+
+    wrapper.register_pre_step_callback(first)
+    wrapper.register_pre_step_callback(second)
+    wrapper.register_pre_step_callback(third)
+    with pytest.raises(RuntimeError, match="boom"):
+        wrapper.new_step_starts()
+    assert fired == ["first", "second"]
 
 
 def test_drain_via_pre_step_callback_end_to_end():
@@ -209,3 +237,93 @@ def test_drain_via_pre_step_callback_end_to_end():
     assert stm.req_to_blocks["req-0"][1].block_id == block_ids[1]
     assert stm.req_to_blocks["req-0"][2] is stm._null_block
     assert pending == {}
+
+
+# Manager-construction hook (KVCacheManager.__init__). A compressed-KV
+# backend registers its pre-step callback here; the scheduler must not
+# receive a manager whose backend failed to register that state.
+
+
+def _real_mgr(monkeypatch, backend_cls):
+    """Construct a real KVCacheManager with `backend_cls` as the resolved
+    attention backend."""
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+
+    monkeypatch.setattr("vllm.config.get_current_vllm_config_or_none", lambda: object())
+    monkeypatch.setattr(
+        "vllm.v1.attention.backend.AttentionBackend.resolve_user_selected_backend",
+        staticmethod(lambda cfg: backend_cls),
+    )
+    config = KVCacheConfig(
+        num_blocks=16,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            )
+        ],
+    )
+    return KVCacheManager(
+        config,
+        max_model_len=64,
+        scheduler_block_size=4,
+        hash_block_size=4,
+    )
+
+
+def test_on_kv_manager_created_fires_on_construction(monkeypatch):
+    seen: list[object] = []
+
+    class Backend:
+        @classmethod
+        def on_kv_manager_created(cls, mgr):
+            seen.append(mgr)
+
+    mgr = _real_mgr(monkeypatch, Backend)
+    assert seen == [mgr]
+
+
+def test_failing_on_kv_manager_created_aborts_construction(monkeypatch):
+    # The hook is how a backend registers manager-side state. Swallowing
+    # the failure hands the scheduler a manager that silently lacks it.
+    class Backend:
+        @classmethod
+        def on_kv_manager_created(cls, mgr):
+            raise RuntimeError("registration refused")
+
+    with pytest.raises(RuntimeError, match="registration refused"):
+        _real_mgr(monkeypatch, Backend)
+
+
+def test_manager_built_without_a_current_config_dispatches_nothing(monkeypatch):
+    # Standalone harnesses build a manager outside set_current_vllm_config;
+    # there is no backend to dispatch on, so there is no hook to run.
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+
+    monkeypatch.setattr("vllm.config.get_current_vllm_config_or_none", lambda: None)
+
+    def explode(cfg):
+        raise AssertionError("backend resolution must not be attempted")
+
+    monkeypatch.setattr(
+        "vllm.v1.attention.backend.AttentionBackend.resolve_user_selected_backend",
+        staticmethod(explode),
+    )
+    config = KVCacheConfig(
+        num_blocks=16,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            )
+        ],
+    )
+    KVCacheManager(config, max_model_len=64, scheduler_block_size=4, hash_block_size=4)
