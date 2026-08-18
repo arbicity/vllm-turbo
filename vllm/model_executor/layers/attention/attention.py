@@ -436,7 +436,7 @@ class Attention(nn.Module, AttentionLayerBase):
 
             try:
                 _tq_lidx = extract_layer_index(prefix)
-            except (AssertionError, ValueError):
+            except (AssertionError, IndexError, ValueError):
                 # extract_layer_index rejects prefixes that carry no single
                 # layer ordinal. The backend receives no index and decides
                 # for itself: it raises when it needs a per-layer lookup and
