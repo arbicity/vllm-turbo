@@ -121,6 +121,7 @@ class KVBlockZeroer:
         """
         self.device = device
         self._meta: tuple[torch.Tensor, torch.Tensor, int, int, int] | None = None
+        self.real_num_blocks: int | None = None
 
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
@@ -149,6 +150,11 @@ class KVBlockZeroer:
                 kv = static_forward_context[layer_name].kv_cache
                 if not isinstance(kv, torch.Tensor):
                     continue
+                n_blocks_here = int(kv.shape[block_dim])
+                if self.real_num_blocks is None:
+                    self.real_num_blocks = n_blocks_here
+                else:
+                    self.real_num_blocks = min(self.real_num_blocks, n_blocks_here)
                 dp = kv.data_ptr()
                 if dp in seen_ptrs:
                     continue
@@ -209,6 +215,8 @@ class KVBlockZeroer:
 
     def warmup(self, num_kv_blocks: int) -> None:
         """JIT-compile the zeroing kernel before the first real request."""
+        if self.real_num_blocks is not None:
+            num_kv_blocks = min(num_kv_blocks, self.real_num_blocks)
         if num_kv_blocks > 0:
             self.zero_block_ids([0])
 

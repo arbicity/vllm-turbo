@@ -1,0 +1,52 @@
+# Tell turbo-attn to rebuild the vllm engine image when this fork changes.
+#
+# WHY THIS EXISTS: turbo-attn's build-engine-images workflow listens for
+#   repository_dispatch: types: [vllm-fork-updated]
+# but NOTHING was sending it. This fork's only workflows are the ones
+# inherited from upstream vLLM. So a fix merged here never rebuilt the
+# engine image, and every box kept running the previous code — which is how
+# the TurboQuant `cache_dtype='auto'` bug survived three separate "fixes"
+# (each one hand-patched into a running image, then wiped by the next build).
+#
+# Fail-loud on purpose: if the PAT is missing or unscoped, this job FAILS
+# rather than silently not dispatching. A quiet no-op is the exact failure
+# mode this file exists to prevent.
+name: notify-turbo-attn
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'vllm/**'
+      - 'setup.py'
+      - 'pyproject.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: dispatch vllm-fork-updated to arbicity/turbo-attn
+        env:
+          PAT: ${{ secrets.SWARM_REPO_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PAT:-}" ]; then
+            echo "::error::SWARM_REPO_PAT is not available to this repo — the" \
+                 "engine image will NOT be rebuilt and this fork's changes will" \
+                 "not reach any box. Scope the org secret to arbicity/vllm-turbo."
+            exit 1
+          fi
+          code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/arbicity/turbo-attn/dispatches \
+            -d '{"event_type":"vllm-fork-updated"}')
+          echo "HTTP $code"; cat /tmp/resp.json || true
+          # 204 = accepted. Anything else is a real failure.
+          [ "$code" = "204" ] || { echo "::error::dispatch failed (HTTP $code)"; exit 1; }
+          echo "dispatched vllm-fork-updated -> arbicity/turbo-attn"
