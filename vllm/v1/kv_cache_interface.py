@@ -82,6 +82,29 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     return KVQuantMode.NONE
 
 
+def kv_cache_dtype_is_backend_managed(kv_cache_dtype: str) -> bool:
+    """True when the ATTENTION BACKEND owns this dtype string end-to-end.
+
+    Such a dtype is quantized, but its layout is not modelled by
+    :class:`KVQuantMode` — the backend parses the preset name itself. It must
+    therefore reach the backend VERBATIM and must never be downgraded to
+    ``"auto"`` by the skip-layer logic, which assumes ``KVQuantMode.NONE``
+    means "this layer is unquantized".
+
+    Requiring ``KVQuantMode.NONE`` keeps every dtype that
+    :func:`get_kv_quant_mode` does classify out of this predicate, so a layer
+    genuinely skipped by ``--kv-cache-dtype-skip-layers`` under such a dtype
+    still gets the unquantized shape.
+    """
+    from vllm.config.cache import is_plugin_cache_dtype
+
+    return (
+        isinstance(kv_cache_dtype, str)
+        and get_kv_quant_mode(kv_cache_dtype) == KVQuantMode.NONE
+        and is_plugin_cache_dtype(kv_cache_dtype)
+    )
+
+
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
     return get_kv_quant_mode(kv_cache_dtype) != KVQuantMode.NONE
 
