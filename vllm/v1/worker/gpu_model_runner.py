@@ -167,6 +167,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
+    kv_cache_dtype_is_backend_managed,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.outputs import (
@@ -7420,9 +7421,14 @@ class GPUModelRunner(
 
                     # Skipped layers (--kv-cache-dtype-skip-layers) need
                     # the unquantized shape.
+                    _lcd = (
+                        getattr(kv_cache_spec, "cache_dtype_str", None)
+                        or self.cache_config.cache_dtype
+                    )
                     layer_cache_dtype_str = (
                         "auto"
                         if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+                        and not kv_cache_dtype_is_backend_managed(_lcd)
                         else getattr(
                             kv_cache_spec,
                             "cache_dtype_str",

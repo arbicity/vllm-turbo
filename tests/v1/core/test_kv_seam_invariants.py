@@ -6,29 +6,56 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.config.cache import _BUILTIN_CACHE_DTYPES
+from vllm.config.cache import (
+    _BUILTIN_CACHE_DTYPES,
+    _PLUGIN_CACHE_DTYPES,
+    register_cache_dtype,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVQuantMode,
     get_kv_quant_mode,
+    kv_cache_dtype_is_backend_managed,
 )
 from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
 
 pytestmark = pytest.mark.cpu_test
 
-BACKEND_MANAGED_DTYPES = sorted(
+TURBOQUANT_DTYPES = sorted(
     d for d in _BUILTIN_CACHE_DTYPES if d.startswith("turboquant")
 )
 
 
-@pytest.mark.parametrize("cache_dtype", BACKEND_MANAGED_DTYPES)
-def test_backend_managed_dtype_maps_to_a_quant_mode(cache_dtype):
+@pytest.mark.parametrize("cache_dtype", TURBOQUANT_DTYPES)
+def test_turboquant_dtype_maps_to_a_quant_mode(cache_dtype):
     # The skip-layer branches in gpu_model_runner and gpu/attn_utils read
     # KVQuantMode.NONE as "this layer is unquantized" and hand the backend
-    # "auto" in place of the dtype string. A dtype whose page layout only the
-    # attention backend understands must reach it verbatim, so it must never
-    # map to NONE.
+    # "auto" in place of the dtype string. A dtype KVQuantMode does model must
+    # not reach them as NONE, or every layer using it loses its packed layout.
     assert get_kv_quant_mode(cache_dtype) != KVQuantMode.NONE
+
+
+@pytest.mark.parametrize("cache_dtype", TURBOQUANT_DTYPES)
+def test_modelled_dtype_is_not_backend_managed(cache_dtype):
+    # A layer skipped by --kv-cache-dtype-skip-layers under such a dtype keeps
+    # KVQuantMode.NONE and must still be sized unquantized, so the predicate
+    # must not claim the dtype back for the backend.
+    assert not kv_cache_dtype_is_backend_managed(cache_dtype)
+
+
+def test_plugin_dtype_is_backend_managed():
+    name = "test_backend_managed_kv_dtype"
+    register_cache_dtype(name, torch.uint8)
+    try:
+        assert get_kv_quant_mode(name) == KVQuantMode.NONE
+        assert kv_cache_dtype_is_backend_managed(name)
+    finally:
+        _PLUGIN_CACHE_DTYPES.discard(name)
+
+
+@pytest.mark.parametrize("cache_dtype", ["auto", "bfloat16", "fp8", "nvfp4"])
+def test_stock_dtype_is_not_backend_managed(cache_dtype):
+    assert not kv_cache_dtype_is_backend_managed(cache_dtype)
 
 
 class _BlockDimZeroBackend:
