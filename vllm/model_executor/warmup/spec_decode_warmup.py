@@ -176,9 +176,11 @@ def spec_decode_prep_kernel_warmup(worker: "Worker") -> None:
         _warm_eagle_padded_prep_kernels(worker, num_spec_tokens)
         _warm_rejection_expand_kernel(worker, num_spec_tokens)
         torch.cuda.synchronize()
-    except Exception as e:
-        logger.warning(
-            "Spec-decode input-prep kernel warmup failed (%s); first "
-            "request will pay the JIT cost.",
-            e,
+    except Exception:
+        # These kernels JIT on first use, so skipping the warmup costs
+        # latency on the first request and nothing else; a kernel that is
+        # genuinely broken fails again, loudly, when that request runs.
+        logger.exception(
+            "Spec-decode input-prep kernel warmup failed; the first "
+            "request will pay the JIT cost."
         )

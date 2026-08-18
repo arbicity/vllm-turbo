@@ -1573,8 +1573,15 @@ def get_kv_cache_config_from_groups(
                 try:
                     vocab = vllm_config.model_config.get_vocab_size()
                     _sampler_reserve_bytes = vocab * max_seqs * 8 * 5
-                except Exception:
+                except (AttributeError, ValueError):
+                    # A model config that reports no vocab size still needs
+                    # sampler headroom; the flat reserve covers it.
                     _sampler_reserve_bytes = 512 * 1024 * 1024
+                    logger.warning(
+                        "Model config reports no vocab size; reserving a "
+                        "flat %d MiB of sampler headroom.",
+                        _sampler_reserve_bytes // (1024 * 1024),
+                    )
             else:
                 _sampler_reserve_bytes = _sampler_reserve_mib * 1024 * 1024
             attn_memory = available_memory - mamba_memory - _sampler_reserve_bytes

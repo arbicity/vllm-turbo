@@ -140,7 +140,8 @@ def enable_cutedsl_compile_only_cache() -> None:
 
     try:
         from cutlass.base_dsl.dsl import BaseDSL
-    except Exception:
+    except ImportError:
+        # No cutlass DSL installed means no cute.compile calls to cache.
         logger.debug("cutlass DSL not importable; no compile cache to enable.")
         return
 
