@@ -48,7 +48,15 @@ def _warm_eagle_step_kernel(worker: "Worker", drafter) -> None:
     # (On hybrid models, group 0 can be a mamba/GDN group with a
     # different width.)
     max_num_seqs = worker.scheduler_config.max_num_seqs
-    kv_cache_gid = getattr(drafter, "kv_cache_gid", 0)
+    # Every proposer class reaching this point (gated on
+    # ``_slot_mapping_buffer`` above) sets ``kv_cache_gid`` to -1 by
+    # default (SpecDecodeBaseProposer.__init__, or independently on
+    # ExtractHiddenStatesProposer, which doesn't inherit from it) — so
+    # this getattr default is currently unreachable. Match -1, not 0:
+    # if a future proposer class ever broke that invariant, defaulting
+    # to 0 would silently assume "bound to group 0" instead of
+    # correctly falling into the "unbound" skip branch below.
+    kv_cache_gid = getattr(drafter, "kv_cache_gid", -1)
     if kv_cache_gid < 0:
         # Drafter did not bind a KV-cache group (e.g. -1 sentinel);
         # warming an arbitrary group's width would compile the wrong
