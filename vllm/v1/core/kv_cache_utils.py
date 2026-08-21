@@ -1566,9 +1566,7 @@ def get_kv_cache_config_from_groups(
             # Default: auto-compute from vocab_size * max_seqs * 8 bytes * 5
             # tensors (logits, probs, top_p/k/temp, overhead). Override via
             # VLLM_SAMPLER_RESERVE_MIB env var (0 = use auto-computed value).
-            import os as _os
-            _sampler_reserve_mib = int(_os.environ.get(
-                "VLLM_SAMPLER_RESERVE_MIB", "0"))
+            _sampler_reserve_mib = envs.VLLM_SAMPLER_RESERVE_MIB
             if _sampler_reserve_mib == 0:
                 try:
                     vocab = vllm_config.model_config.get_vocab_size()
