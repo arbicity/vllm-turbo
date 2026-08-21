@@ -1203,16 +1203,18 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
         )
-        # --kv-cache-dtype: use runtime validator so plugins (TKV etc.)
-        # can register additional dtypes via register_cache_dtype(). The
-        # dataclass type alias is now ``str``, so argparse won't auto-
-        # populate choices; we pass the validator explicitly and drop the
-        # Literal-derived choices/metavar that get_kwargs would have added
-        # had the alias still been a Literal.
+        # --kv-cache-dtype: CacheDType's Literal only covers the builtin
+        # values, so get_kwargs() derives --help choices from those alone.
+        # Extend choices to include anything a plugin (TKV etc.) has
+        # registered via register_cache_dtype() by parser-build time, and
+        # keep the runtime validator as the actual gate (it also covers a
+        # plugin registering after the parser is built, if that ever
+        # happens) rather than relying on argparse's own choices check.
+        from vllm.config.cache import cache_dtype_choices as _cache_dtype_choices
         from vllm.config.cache import validate_cache_dtype as _validate_cdt
+
         _kv_kwargs = cache_kwargs["cache_dtype"]
-        _kv_kwargs.pop("choices", None)
-        _kv_kwargs.pop("metavar", None)
+        _kv_kwargs["choices"] = _cache_dtype_choices()
         _kv_kwargs["type"] = _validate_cdt
         cache_group.add_argument("--kv-cache-dtype", **_kv_kwargs)
         cache_group.add_argument(
