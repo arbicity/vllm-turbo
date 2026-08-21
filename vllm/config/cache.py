@@ -3,25 +3,26 @@
 
 from collections.abc import Callable
 from dataclasses import field
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, get_args
 
 from pydantic import Field, field_validator, model_validator
 
 from vllm.config.utils import config
 from vllm.logger import init_logger
-
-try:
-    from vllm.utils.torch_utils import (
-        is_quantized_kv_cache,
-        kv_cache_uses_per_token_head_scales,
-    )
-except ImportError:
-    from vllm.v1.attention.backend import is_quantized_kv_cache
-    kv_cache_uses_per_token_head_scales = lambda x: False
+from vllm.utils.torch_utils import (
+    is_quantized_kv_cache,
+    kv_cache_uses_per_token_head_scales,
+)
 
 logger = init_logger(__name__)
 
-_BUILTIN_CACHE_DTYPES: frozenset[str] = frozenset({
+# Static type for every builtin dtype value; kept as a real Literal (not a
+# bare ``str``) so callers and IDEs still get completion/checking for the
+# common case. Plugins (e.g. tkv) add additional runtime-only names via
+# register_cache_dtype() below — those are validated separately, not
+# reflected in the static type, since a plugin's dtype name doesn't exist
+# until the plugin is imported.
+CacheDType = Literal[
     "auto",
     "float16",
     "bfloat16",
@@ -38,15 +39,10 @@ _BUILTIN_CACHE_DTYPES: frozenset[str] = frozenset({
     "int8_per_token_head",
     "fp8_per_token_head",
     "nvfp4",
-})
+]
+_BUILTIN_CACHE_DTYPES: frozenset[str] = frozenset(get_args(CacheDType))
 # Plugin-registered dtypes added at runtime via register_cache_dtype().
 _PLUGIN_CACHE_DTYPES: set[str] = set()
-
-# Kept as a type alias; argparse validation now goes through
-# validate_cache_dtype() which consults the runtime registry. The builtin
-# set above (incl. vLLM's native ``turboquant_*``) is the source of truth;
-# plugins (e.g. tkv) add names at runtime via register_cache_dtype().
-CacheDType = str
 
 
 def register_cache_dtype(name: str, torch_dtype) -> None:
@@ -70,6 +66,12 @@ def validate_cache_dtype(name: str) -> str:
             f"Allowed: {sorted(allowed)}"
         )
     return name
+
+
+def cache_dtype_choices() -> list[str]:
+    """All valid ``--kv-cache-dtype`` values: builtins plus anything
+    registered via ``register_cache_dtype()`` so far (parser-build time)."""
+    return sorted(_BUILTIN_CACHE_DTYPES | _PLUGIN_CACHE_DTYPES)
 
 
 def is_plugin_cache_dtype(name: str) -> bool:

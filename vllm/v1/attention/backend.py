@@ -188,6 +188,20 @@ class AttentionBackend(ABC):
         """
         return None
 
+    @classmethod
+    def uses_per_group_kv_pool(cls) -> bool:
+        """Whether this backend manages hybrid attention/mamba block-size
+        alignment itself via a per-group KV pool, instead of vLLM's
+        default shared-pool alignment.
+
+        Default False: vLLM pads the mamba page size to match the
+        (LCM-aligned) attention page size so both groups share one block
+        pool. A backend that keeps attention and mamba in separate
+        per-group pools, each sized from its own spec, doesn't need that
+        alignment and should return True to skip it.
+        """
+        return False
+
     def get_gather_op(self):
         """Custom replacement for vLLM's gather_and_maybe_dequant_cache
         op, or None to use the default. Used by MLA backends that store
@@ -245,6 +259,19 @@ class AttentionBackend(ABC):
         resolve draft-tower attention layers (e.g. ``mtp.layers.*``)
         against the drafter's own module tree — they do not exist in the
         target model passed to on_model_loaded.
+        """
+        pass
+
+    @classmethod  # noqa: B027
+    def on_kv_cache_initialized(cls, worker) -> None:
+        """Called once per worker after KV cache allocation, before
+        CUDA-graph capture starts. Receives the worker.
+
+        Use case: compressed-KV backend that needs to warm any
+        per-config decode autotune during the eager, pre-capture window
+        instead of lazily during the first live request or during
+        capture — skipping this hook defers that work into the first
+        live request, which can exceed a client's request timeout.
         """
         pass
 

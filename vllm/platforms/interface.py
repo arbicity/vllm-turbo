@@ -789,13 +789,11 @@ class Platform:
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
 
-        # TKV uses per-group BlockPool — attention and mamba live in
-        # separate per-group pools each sized from its own spec, so raising
-        # attention block_size to cover the mamba page size does not apply.
-        #
-        # Prefix, not equality: every tkv-family dtype ("tkv", "tkv-bypass")
-        # serves through the same backend and the same per-group pool.
-        if str(cache_config.cache_dtype).startswith("tkv"):
+        # Backend-declared: a backend using per-group KV pools (e.g. the
+        # tkv backend) manages attention/mamba block-size alignment itself,
+        # so raising attention block_size to cover the mamba page size
+        # does not apply.
+        if backend_cls.uses_per_group_kv_pool():
             return
 
         if cache_config.cache_dtype == "auto":

@@ -227,6 +227,8 @@ if TYPE_CHECKING:
     VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: int = 300
     VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS: int = 5
     VLLM_KV_CACHE_LAYOUT: Literal["NHD", "HND"] | None = None
+    VLLM_SAMPLER_RESERVE_MIB: int = 0
+    VLLM_KV_CACHE_SKIP_LAYERS_DTYPE: str = "auto"
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
@@ -1715,6 +1717,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # implement and support a subset of all possible layouts.
     "VLLM_KV_CACHE_LAYOUT": env_with_choices(
         "VLLM_KV_CACHE_LAYOUT", None, ["NHD", "HND"]
+    ),
+    # Explicit sampler-warmup memory headroom (MiB) reserved after KV cache
+    # allocation, ahead of the auto-computed default. 0 = use the
+    # auto-computed value (vocab_size * max_seqs * 8 bytes * 5 tensors).
+    "VLLM_SAMPLER_RESERVE_MIB": lambda: int(os.getenv("VLLM_SAMPLER_RESERVE_MIB", "0")),
+    # kv_cache_dtype used for layers that opt out of the model's configured
+    # KV cache dtype via --kv-cache-dtype-skip-layers, when the CacheConfig
+    # field is left at its "auto" default. A CLI/programmatic value on the
+    # config field wins over this env var.
+    "VLLM_KV_CACHE_SKIP_LAYERS_DTYPE": lambda: os.getenv(
+        "VLLM_KV_CACHE_SKIP_LAYERS_DTYPE", "auto"
     ),
     # SSM conv state layout used for Mamba models.
     # - SD: (state_len, dim) — dim contiguous (default)

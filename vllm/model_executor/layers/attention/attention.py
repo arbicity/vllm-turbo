@@ -317,9 +317,7 @@ class Attention(nn.Module, AttentionLayerBase):
                     cache_config, "kv_cache_dtype_skip_layers_dtype",
                     "auto")
                 if skip_dtype == "auto":
-                    import os
-                    skip_dtype = os.environ.get(
-                        "VLLM_KV_CACHE_SKIP_LAYERS_DTYPE", "auto")
+                    skip_dtype = envs.VLLM_KV_CACHE_SKIP_LAYERS_DTYPE
                 kv_cache_dtype = skip_dtype
                 # fp8 skip layers need scale computation (default 1.0 when
                 # not checkpoint-baked). bf16/auto skip layers don't.

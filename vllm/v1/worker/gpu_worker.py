@@ -130,10 +130,9 @@ def _backends_in_use(worker) -> list[type]:
     below was skipped for it — silently, since nothing raised and the guarding
     ``if`` simply did not take.
 
-    Measured 2026-08-03: with ``on_kv_cache_initialized`` skipped, a
-    compressed-KV backend never got its pre-capture warm-up window and ran its
-    whole decode autotune inside the FIRST request — "41 (batch, bucket) cells
-    swept in 207.53s" — past the client timeout, on an idle box.
+    Skipping this hook defers a backend's autotune into the first live
+    request instead of the pre-capture warm-up window, which can exceed
+    a client's request timeout.
 
     ``model_runner.attn_groups[*].backend`` is the class in use regardless of
     how it was selected. Falls back to the user-selected enum when no groups
@@ -805,10 +804,9 @@ class Worker(WorkerBase):
         # for backends that don't define the hook.
         _backends = _backends_in_use(self)
         for _backend_cls in _backends:
-            if hasattr(_backend_cls, "on_kv_cache_initialized"):
-                _call_backend_hook(
-                    _backend_cls, "on_kv_cache_initialized", _backends, self
-                )
+            _call_backend_hook(
+                _backend_cls, "on_kv_cache_initialized", _backends, self
+            )
 
         warmup_sizes: list[int] = []
 
