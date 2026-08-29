@@ -17,11 +17,16 @@ from vllm.utils.torch_utils import (
 logger = init_logger(__name__)
 
 # Static type for every builtin dtype value; kept as a real Literal (not a
-# bare ``str``) so callers and IDEs still get completion/checking for the
-# common case. Plugins (e.g. tkv) add additional runtime-only names via
-# register_cache_dtype() below — those are validated separately, not
-# reflected in the static type, since a plugin's dtype name doesn't exist
-# until the plugin is imported.
+# bare ``str``) so callers and IDEs get completion/checking for the common
+# case, and so ``cache_dtype_choices()`` has a source of truth for --help.
+#
+# It is NOT the annotation of ``CacheConfig.cache_dtype``: that field is
+# pydantic-validated, a Literal annotation is compiled into the class's
+# validator at class-creation time, and a plugin's dtype name does not exist
+# until the plugin is imported — which is after this module. Annotating the
+# field with this Literal makes every register_cache_dtype() name
+# unconstructible. The field is therefore typed ``str`` and gated at runtime
+# by validate_cache_dtype(), which consults builtins + the plugin registry.
 CacheDType = Literal[
     "auto",
     "float16",
@@ -122,7 +127,7 @@ class CacheConfig:
     not matter if you have another vLLM instance running on the same GPU. For
     example, if you have two vLLM instances running on the same GPU, you can
     set the GPU memory utilization to 0.5 for each instance."""
-    cache_dtype: CacheDType = "auto"
+    cache_dtype: str = "auto"
     """Data type for kv cache storage. If "auto", will use model data type.
     CUDA 11.8+ supports fp8 (=fp8_e4m3) and fp8_e5m2. ROCm (AMD GPU) supports
     fp8 (=fp8_e4m3). Intel Gaudi (HPU) supports fp8 (using fp8_inc).
@@ -340,7 +345,11 @@ class CacheConfig:
 
     @field_validator("cache_dtype", mode="after")
     @classmethod
-    def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:
+    def _validate_cache_dtype(cls, cache_dtype: str) -> str:
+        # The membership gate for the field. It lives here rather than in the
+        # annotation because the allowed set is only complete once plugins have
+        # registered (see CacheDType above).
+        validate_cache_dtype(cache_dtype)
         if kv_cache_uses_per_token_head_scales(cache_dtype):
             logger.info(
                 "Using %s data type to store kv cache. It reduces the GPU "

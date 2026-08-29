@@ -1203,13 +1203,15 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
         )
-        # --kv-cache-dtype: CacheDType's Literal only covers the builtin
-        # values, so get_kwargs() derives --help choices from those alone.
-        # Extend choices to include anything a plugin (TKV etc.) has
-        # registered via register_cache_dtype() by parser-build time, and
-        # keep the runtime validator as the actual gate (it also covers a
-        # plugin registering after the parser is built, if that ever
-        # happens) rather than relying on argparse's own choices check.
+        # --kv-cache-dtype: CacheConfig.cache_dtype is typed `str` (a Literal
+        # there would make plugin-registered dtypes unconstructible — see
+        # vllm/config/cache.py), so get_kwargs() derives no choices for it.
+        # Supply them from the registry: builtins plus whatever a plugin (TKV
+        # etc.) registered by parser-build time, which is what --help lists and
+        # what argparse itself checks. `type` is the same registry lookup, so a
+        # rejected value reports the full allowed set instead of argparse's
+        # bare choices message. CacheConfig's own field validator is the gate on
+        # the non-CLI path, and the only one that sees a late registration.
         from vllm.config.cache import cache_dtype_choices as _cache_dtype_choices
         from vllm.config.cache import validate_cache_dtype as _validate_cdt
 
