@@ -94,6 +94,29 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     return KVQuantMode.NONE
 
 
+def kv_cache_dtype_is_backend_managed(kv_cache_dtype: str) -> bool:
+    """True when the ATTENTION BACKEND owns this dtype string end-to-end.
+
+    Such a dtype is quantized, but its layout is not modelled by
+    :class:`KVQuantMode` — the backend parses the preset name itself. It must
+    therefore reach the backend VERBATIM and must never be downgraded to
+    ``"auto"`` by the skip-layer logic, which assumes ``KVQuantMode.NONE``
+    means "this layer is unquantized".
+
+    Requiring ``KVQuantMode.NONE`` keeps every dtype that
+    :func:`get_kv_quant_mode` does classify out of this predicate, so a layer
+    genuinely skipped by ``--kv-cache-dtype-skip-layers`` under such a dtype
+    still gets the unquantized shape.
+    """
+    from vllm.config.cache import is_plugin_cache_dtype
+
+    return (
+        isinstance(kv_cache_dtype, str)
+        and get_kv_quant_mode(kv_cache_dtype) == KVQuantMode.NONE
+        and is_plugin_cache_dtype(kv_cache_dtype)
+    )
+
+
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
     return get_kv_quant_mode(kv_cache_dtype) != KVQuantMode.NONE
 
@@ -161,6 +184,23 @@ class KVCacheSpec:
     def storage_block_size(self) -> int:
         return self.block_size
 
+    @property
+    def aggregated_layer_count(self) -> int:
+        """How many model layers this spec's `page_size_bytes` already covers.
+
+        Default 1: a page holds one layer's tokens, so a group of N layers
+        needs N tensors and N * page_size_bytes per block.
+
+        A spec may instead FUSE several layers into one shared page — the
+        layers occupy disjoint byte slices of the same page, and
+        `page_size_bytes` is the SUM of their per-layer pages. Such a spec
+        returns the number of layers fused, and a group of N layers then
+        needs N / aggregated_layer_count tensors. Sizing that group per
+        layer would charge the summed page once per layer and cut usable
+        KV capacity by this factor.
+        """
+        return 1
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         """
         The maximum possible memory usage of this KV cache in bytes.
@@ -181,6 +221,17 @@ class KVCacheSpec:
                 encoder length for encoder-decoder models.
         """
         return cdiv(max_len, self.block_size)
+
+    @classmethod
+    def get_manager_class(cls):
+        """Return the SingleTypeKVCacheManager subclass that handles this
+        spec, or None to fall through to the module-level
+        `spec_manager_map` lookup.
+
+        Plugin specs override this so they don't need to mutate
+        `spec_manager_map` at plugin registration time.
+        """
+        return None
 
     def copy_with_new_block_size(self, block_size: int) -> Self:
         """
@@ -959,7 +1010,7 @@ class KVCacheConfig:
     """
 
     num_blocks: int
-    """The number of KV cache blocks"""
+    """The number of KV cache blocks (for the primary/attention groups)"""
     kv_cache_tensors: list[KVCacheTensor]
     """How should model runner initialize the KV cache tensors for each layer"""
     kv_cache_groups: list[KVCacheGroupSpec]
@@ -970,6 +1021,12 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    per_group_num_blocks: list[int] | None = None
+    """Per-group block counts. When set, each KV cache group gets its own
+    BlockPool with the specified number of blocks. This enables split
+    allocation where O(1) groups (e.g., mamba in none/align mode) get a
+    small fixed pool and O(n) groups (attention) get the rest of memory.
+    If None, all groups share a single pool with num_blocks blocks."""
 
     @property
     def has_mamba_layers(self) -> bool:

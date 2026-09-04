@@ -705,6 +705,9 @@ class EngineArgs:
     kv_cache_dtype_skip_layers: list[str] = get_field(
         CacheConfig, "kv_cache_dtype_skip_layers"
     )
+    kv_cache_dtype_skip_layers_dtype: str = (
+        CacheConfig.kv_cache_dtype_skip_layers_dtype
+    )
     mamba_cache_dtype: MambaDType = CacheConfig.mamba_cache_dtype
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
@@ -1210,7 +1213,22 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
         )
-        cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
+        # --kv-cache-dtype: CacheConfig.cache_dtype is typed `str` (a Literal
+        # there would make plugin-registered dtypes unconstructible — see
+        # vllm/config/cache.py), so get_kwargs() derives no choices for it.
+        # Supply them from the registry: builtins plus whatever a plugin (TKV
+        # etc.) registered by parser-build time, which is what --help lists and
+        # what argparse itself checks. `type` is the same registry lookup, so a
+        # rejected value reports the full allowed set instead of argparse's
+        # bare choices message. CacheConfig's own field validator is the gate on
+        # the non-CLI path, and the only one that sees a late registration.
+        from vllm.config.cache import cache_dtype_choices as _cache_dtype_choices
+        from vllm.config.cache import validate_cache_dtype as _validate_cdt
+
+        _kv_kwargs = cache_kwargs["cache_dtype"]
+        _kv_kwargs["choices"] = _cache_dtype_choices()
+        _kv_kwargs["type"] = _validate_cdt
+        cache_group.add_argument("--kv-cache-dtype", **_kv_kwargs)
         cache_group.add_argument(
             "--num-gpu-blocks-override", **cache_kwargs["num_gpu_blocks_override"]
         )
@@ -1226,6 +1244,10 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-cache-dtype-skip-layers", **cache_kwargs["kv_cache_dtype_skip_layers"]
+        )
+        cache_group.add_argument(
+            "--kv-cache-dtype-skip-layers-dtype",
+            **cache_kwargs["kv_cache_dtype_skip_layers_dtype"],
         )
         cache_group.add_argument(
             "--kv-sharing-fast-prefill", **cache_kwargs["kv_sharing_fast_prefill"]
@@ -2002,6 +2024,8 @@ class EngineArgs:
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
+            kv_cache_dtype_skip_layers_dtype=(
+                self.kv_cache_dtype_skip_layers_dtype),
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,

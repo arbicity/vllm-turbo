@@ -215,3 +215,98 @@ def test_varlen_with_paged_kv(
         torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
         f"{torch.max(torch.abs(output - ref_output))}",
     )
+
+
+@pytest.mark.parametrize("num_splits", [2, 5, 16])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(6, 16384)],
+        [(6, 8192), (6, 8191), (6, 4097)],
+        [(1, 4096), (6, 4096), (37, 4096)],
+        [(4, 129), (1, 8000), (12, 33)],
+    ],
+)
+@pytest.mark.parametrize("num_heads", [(12, 2), (4, 4)])
+@pytest.mark.parametrize("head_size", [128, 256])
+@pytest.mark.parametrize("sliding_window", [None, 256])
+@torch.inference_mode()
+def test_fa2_varlen_paged_kv_split_kv(
+    num_splits: int,
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    sliding_window: int | None,
+) -> None:
+    """Split-K must not change varlen paged-KV output or LSE at `max_seqlen_q > 1`.
+
+    The combine kernel addresses O and LSE through `cu_seqlens_q`, so this also
+    covers non-uniform query lengths, where the padded scratch layout and the
+    unpadded output layout diverge.
+    """
+    if not is_fa_version_supported(2):
+        pytest.skip(f'FA2 unsupported: "{fa_version_unsupported_reason(2)}"')
+    torch.set_default_device("cuda")
+    set_random_seed(0)
+
+    dtype = torch.bfloat16
+    block_size = 16
+    num_blocks = 2048
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+    num_query_heads, num_kv_heads = num_heads
+    scale = head_size**-0.5
+    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+
+    query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype
+    )
+    value_cache = torch.randn_like(key_cache)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32)
+    max_num_blocks_per_seq = (max(kv_lens_list) + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0, num_blocks, (len(seq_lens), max_num_blocks_per_seq), dtype=torch.int32
+    )
+
+    def run(splits: int):
+        return flash_attn_varlen_func(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max(query_lens),
+            max_seqlen_k=max(kv_lens_list),
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            num_splits=splits,
+            return_softmax_lse=True,
+            fa_version=2,
+        )
+
+    out_ref, lse_ref = run(1)
+    out_split, lse_split = run(num_splits)
+
+    # Split-K reorders the softmax reduction, so agreement is bounded by the
+    # bf16 output step (2^-8), not by the fp32 accumulation.
+    torch.testing.assert_close(out_split, out_ref, atol=1e-2, rtol=1e-2)
+    finite = torch.isfinite(lse_ref)
+    torch.testing.assert_close(lse_split[finite], lse_ref[finite], atol=5e-3, rtol=5e-3)
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        sliding_window=sliding_window,
+    )
+    torch.testing.assert_close(out_split, ref_output, atol=1.5e-2, rtol=1e-2)

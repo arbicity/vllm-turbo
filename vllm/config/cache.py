@@ -3,7 +3,7 @@
 
 from collections.abc import Callable
 from dataclasses import field
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, get_args
 
 from pydantic import Field, field_validator, model_validator
 
@@ -16,6 +16,17 @@ from vllm.utils.torch_utils import (
 
 logger = init_logger(__name__)
 
+# Static type for every builtin dtype value; kept as a real Literal (not a
+# bare ``str``) so callers and IDEs get completion/checking for the common
+# case, and so ``cache_dtype_choices()`` has a source of truth for --help.
+#
+# It is NOT the annotation of ``CacheConfig.cache_dtype``: that field is
+# pydantic-validated, a Literal annotation is compiled into the class's
+# validator at class-creation time, and a plugin's dtype name does not exist
+# until the plugin is imported — which is after this module. Annotating the
+# field with this Literal makes every register_cache_dtype() name
+# unconstructible. The field is therefore typed ``str`` and gated at runtime
+# by validate_cache_dtype(), which consults builtins + the plugin registry.
 CacheDType = Literal[
     "auto",
     "float16",
@@ -35,6 +46,49 @@ CacheDType = Literal[
     "nvfp4",
     "nvfp4_4over6",
 ]
+_BUILTIN_CACHE_DTYPES: frozenset[str] = frozenset(get_args(CacheDType))
+# Plugin-registered dtypes added at runtime via register_cache_dtype().
+_PLUGIN_CACHE_DTYPES: set[str] = set()
+
+
+def register_cache_dtype(name: str, torch_dtype) -> None:
+    """Register a custom KV cache dtype contributed by a plugin.
+
+    After this call, ``--kv-cache-dtype <name>`` will be accepted by
+    argparse and the name will be mapped to ``torch_dtype`` in
+    STR_DTYPE_TO_TORCH_DTYPE.
+    """
+    from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+    _PLUGIN_CACHE_DTYPES.add(name)
+    STR_DTYPE_TO_TORCH_DTYPE[name] = torch_dtype
+
+
+def validate_cache_dtype(name: str) -> str:
+    """argparse ``type=`` callable. Validates against builtins + plugins."""
+    allowed = _BUILTIN_CACHE_DTYPES | _PLUGIN_CACHE_DTYPES
+    if name not in allowed:
+        raise ValueError(
+            f"Unknown --kv-cache-dtype {name!r}. "
+            f"Allowed: {sorted(allowed)}"
+        )
+    return name
+
+
+def cache_dtype_choices() -> list[str]:
+    """All valid ``--kv-cache-dtype`` values: builtins plus anything
+    registered via ``register_cache_dtype()`` so far (parser-build time)."""
+    return sorted(_BUILTIN_CACHE_DTYPES | _PLUGIN_CACHE_DTYPES)
+
+
+def is_plugin_cache_dtype(name: str) -> bool:
+    """Return True if ``name`` was registered via ``register_cache_dtype``.
+
+    Used by arg post-processing to auto-default ``--attention-backend`` to
+    ``CUSTOM`` when the user selects a plugin-registered KV cache dtype.
+    """
+    return name in _PLUGIN_CACHE_DTYPES
+
+
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
@@ -74,7 +128,7 @@ class CacheConfig:
     not matter if you have another vLLM instance running on the same GPU. For
     example, if you have two vLLM instances running on the same GPU, you can
     set the GPU memory utilization to 0.5 for each instance."""
-    cache_dtype: CacheDType = "auto"
+    cache_dtype: str = "auto"
     """Data type for kv cache storage. If "auto", will use model data type.
     CUDA 11.8+ supports fp8 (=fp8_e4m3) and fp8_e5m2. ROCm (AMD GPU) supports
     fp8 (=fp8_e4m3). Intel Gaudi (HPU) supports fp8 (using fp8_inc).
@@ -114,6 +168,13 @@ class CacheConfig:
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
+    kv_cache_dtype_skip_layers_dtype: str = "auto"
+    """KV cache dtype to use for layers skipped by `kv_cache_dtype_skip_layers`.
+    Defaults to "auto" (= model's native bf16/fp16). Setting this to "fp8",
+    "fp8_e4m3", or "fp8_e5m2" halves the KV bytes for skip layers at
+    near-lossless quality — useful for recovering capacity lost to boundary
+    protection. Env var `VLLM_KV_CACHE_SKIP_LAYERS_DTYPE` overrides this
+    field when the field is default ("auto")."""
     mamba_page_size_padded: int | None = None
     """ Optional override for mamba page size; used by hybrid mamba/attention
     models to ensure exact alignment with attention page size."""
@@ -270,7 +331,11 @@ class CacheConfig:
 
     @field_validator("cache_dtype", mode="after")
     @classmethod
-    def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:
+    def _validate_cache_dtype(cls, cache_dtype: str) -> str:
+        # The membership gate for the field. It lives here rather than in the
+        # annotation because the allowed set is only complete once plugins have
+        # registered (see CacheDType above).
+        validate_cache_dtype(cache_dtype)
         if kv_cache_uses_per_token_head_scales(cache_dtype):
             logger.info(
                 "Using %s data type to store kv cache. It reduces the GPU "
