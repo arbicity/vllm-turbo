@@ -2258,7 +2258,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         """Return the gather/dequant op used by chunked-context prefill.
 
         Default: vLLM's stock `ops.gather_and_maybe_dequant_cache`. Plugin
-        impls (e.g. TurboQuantMLAImpl) override this to provide a TQ-aware
+        impls (e.g. TkvMLAImpl) override this to provide a TQ-aware
         gather that dequantizes their packed KV format on read. The op
         signature must match `ops.gather_and_maybe_dequant_cache`.
         """

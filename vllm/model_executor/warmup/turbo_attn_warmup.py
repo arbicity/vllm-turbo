@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Boot-time warmup for the TURBO_ATTN (tkv) attention backend.
 
-The TURBO_ATTN prefill op (``ArbiAttentionForward`` and its loader
+The TURBO_ATTN prefill op (``TurboPrefillForward`` and its loader
 siblings) is a CuTeDSL kernel that is JIT-compiled per
 (loader, geometry, layout) bucket on first use.  Decode buckets are
 exercised by CUDA-graph capture, but prefill attention runs eagerly

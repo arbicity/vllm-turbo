@@ -14,7 +14,7 @@ The cache is enabled by default, but the DSL roots it under
 ``tempfile.gettempdir()`` unless ``CUTE_DSL_CACHE_DIR`` is set.  Inside a
 serve container /tmp is ephemeral, so every boot re-JITs every CuTeDSL
 kernel from scratch — for the TURBO_ATTN lane that is the
-``ArbiAttentionForward`` prefill op stalling the first prefill wave for
+``TurboPrefillForward`` prefill op stalling the first prefill wave for
 several seconds after every restart (arbicity/arbi-serve#977).
 
 This module roots the cache under ``~/.cache/tkv`` (respecting
@@ -121,7 +121,7 @@ def enable_cutedsl_compile_only_cache() -> None:
     ``compile_only=True, no_cache=True``, so the DSL's content-addressed
     on-disk compile cache never applies to explicitly compiled kernels —
     every boot re-runs the full MLIR pipeline + cubin generation for ops
-    like the TURBO_ATTN ``ArbiAttentionForward`` prefill kernel.
+    like the TURBO_ATTN ``TurboPrefillForward`` prefill kernel.
 
     The underlying machinery (``BaseDSL.generate_mlir`` ->
     ``compile_and_cache``) fully supports caching compile-only results:

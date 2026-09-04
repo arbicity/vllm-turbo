@@ -309,7 +309,7 @@ class AttentionBackend(ABC):
 
         Use case: a compressed-KV backend (TKV) that wraps any of
         TritonMLABackend / FlashAttnMLABackend / etc. with a
-        TurboQuantMLA wrapper.
+        TkvMLA wrapper.
         """
         return None
 
