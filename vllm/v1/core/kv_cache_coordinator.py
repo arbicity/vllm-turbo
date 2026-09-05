@@ -77,6 +77,19 @@ class _MultiGroupPoolView:
     def null_block(self) -> "KVCacheBlock":
         return self._null_block
 
+    @property
+    def hash_block_size(self) -> int:
+        """The hashing granularity every group's pool was built with.
+
+        v0.28.0's ``single_type_kv_cache_manager.find_longest_cache_hit``
+        reads this off the pool to rescale block hashes. Every per-group
+        pool here is constructed with the SAME ``hash_block_size`` (it is one
+        argument to this coordinator, and the assert above pins every group's
+        block size to a multiple of it), so the first group's value is the
+        group-invariant one rather than an arbitrary pick.
+        """
+        return next(iter(self.group_pools.values())).hash_block_size
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
