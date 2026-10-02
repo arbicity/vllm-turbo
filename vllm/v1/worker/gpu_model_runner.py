@@ -168,6 +168,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
+    kv_cache_dtype_is_backend_managed,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.outputs import (
@@ -7555,9 +7556,14 @@ class GPUModelRunner(
 
                     # Skipped layers (--kv-cache-dtype-skip-layers) need
                     # the unquantized shape.
+                    _lcd = (
+                        getattr(kv_cache_spec, "cache_dtype_str", None)
+                        or self.cache_config.cache_dtype
+                    )
                     layer_cache_dtype_str = (
                         "auto"
                         if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+                        and not kv_cache_dtype_is_backend_managed(_lcd)
                         else getattr(
                             kv_cache_spec,
                             "cache_dtype_str",
@@ -7565,12 +7571,23 @@ class GPUModelRunner(
                         )
                         or self.cache_config.cache_dtype
                     )
-                    kv_cache_shape = attn_backend.get_kv_cache_shape(
+                    # Pass kv_cache_spec only to backends that accept it
+                    # (e.g. TKV plugin for per-layer bit-width selection).
+                    import inspect as _inspect
+                    _shape_fn = attn_backend.get_kv_cache_shape
+                    _shape_extra = (
+                        {"kv_cache_spec": kv_cache_spec}
+                        if "kv_cache_spec" in _inspect.signature(
+                            _shape_fn).parameters
+                        else {}
+                    )
+                    kv_cache_shape = _shape_fn(
                         kernel_num_blocks,
                         shape_block_size,
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
                         cache_dtype_str=layer_cache_dtype_str,
+                        **_shape_extra,
                     )
                     try:
                         kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()

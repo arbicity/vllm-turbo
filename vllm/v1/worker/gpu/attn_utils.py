@@ -28,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
     KVQuantMode,
     MambaSpec,
     UniformTypeKVCacheSpecs,
+    kv_cache_dtype_is_backend_managed,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import (
@@ -406,6 +407,7 @@ def _reshape_kv_cache(
                 layer_cache_dtype = (
                     "auto"
                     if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+                    and not kv_cache_dtype_is_backend_managed(cache_dtype)
                     else cache_dtype
                 )
                 kv_cache_shape = group.backend.get_kv_cache_shape(

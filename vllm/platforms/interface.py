@@ -791,6 +791,13 @@ class Platform:
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
 
+        # Backend-declared: a backend using per-group KV pools (e.g. the
+        # tkv backend) manages attention/mamba block-size alignment itself,
+        # so raising attention block_size to cover the mamba page size
+        # does not apply.
+        if backend_cls.uses_per_group_kv_pool():
+            return
+
         if cache_config.cache_dtype == "auto":
             kv_cache_dtype = model_config.dtype
         else:
@@ -798,7 +805,7 @@ class Platform:
 
         kv_quant_mode = get_kv_quant_mode(cache_config.cache_dtype)
 
-        # Compute attention page size for 1 token
+        # Compute attention page size for 1 token.
         if model_config.use_mla:
             attn_page_size_1_token = MLAAttentionSpec(
                 block_size=1,
@@ -839,7 +846,14 @@ class Platform:
             else:
                 attn_page_size_1_token = tq_page
         else:
-            attn_spec = FullAttentionSpec(
+            # Backend-declared spec class lets a compressed-KV plugin (e.g. the
+            # tkv backend, dtype "tkv") size its own page without monkey-
+            # patching; falls back to the stock FullAttentionSpec otherwise.
+            # (vLLM-native turboquant_* is handled by the elif above.)
+            spec_cls = backend_cls.get_kv_cache_spec_class("full")
+            if spec_cls is None:
+                spec_cls = FullAttentionSpec
+            attn_spec = spec_cls(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
                 head_size=model_config.get_head_size(),

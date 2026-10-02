@@ -302,8 +302,18 @@ class Attention(nn.Module, AttentionLayerBase):
             if str(layer_idx) in cache_config.kv_cache_dtype_skip_layers:
                 skip = True
             if skip:
-                kv_cache_dtype = "auto"
-            logger.debug(
+                # Env override takes effect only when the config field is
+                # at its default "auto" — CLI / programmatic values win.
+                skip_dtype = getattr(
+                    cache_config, "kv_cache_dtype_skip_layers_dtype",
+                    "auto")
+                if skip_dtype == "auto":
+                    skip_dtype = envs.VLLM_KV_CACHE_SKIP_LAYERS_DTYPE
+                kv_cache_dtype = skip_dtype
+                # fp8 skip layers need scale computation (default 1.0 when
+                # not checkpoint-baked). bf16/auto skip layers don't.
+                calculate_kv_scales = kv_cache_dtype.startswith("fp8")
+            logger.info(
                 "Layer %s: kv_cache_dtype=%s, sliding_window=%s",
                 prefix,
                 kv_cache_dtype,
@@ -407,6 +417,25 @@ class Attention(nn.Module, AttentionLayerBase):
                 extra_impl_args.setdefault("block_n", block_n)
 
         impl_cls = self.attn_backend.get_impl_cls()
+        # Let the TKV backend look up per-layer allocation at init time so
+        # it can set the correct codec bit widths before the slot layout is frozen.
+        if kv_cache_dtype == "tkv" and "_tq_layer_idx" not in extra_impl_args:
+            from vllm.model_executor.models.utils import extract_layer_index
+
+            try:
+                _tq_lidx = extract_layer_index(prefix)
+            except (AssertionError, IndexError, ValueError):
+                # extract_layer_index rejects prefixes that carry no single
+                # layer ordinal. The backend receives no index and decides
+                # for itself: it raises when it needs a per-layer lookup and
+                # uses uniform bit widths when it does not.
+                logger.debug(
+                    "tkv: no layer ordinal in attention prefix %r; the "
+                    "backend resolves its own bit widths.",
+                    prefix,
+                )
+            else:
+                extra_impl_args = {**extra_impl_args, "_tq_layer_idx": _tq_lidx}
         self.impl = impl_cls(  # type: ignore[assignment]  # impl_cls always returns an AttentionImpl subclass
             num_heads,
             head_size,
@@ -607,6 +636,33 @@ class Attention(nn.Module, AttentionLayerBase):
         # Should not be called for enc-dec attention.
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
+        # Backend-declared spec class takes precedence. Plugin backends
+        # with custom KV layouts override get_kv_cache_spec_class on
+        # the AttentionBackend subclass; if they return None we fall
+        # through to the existing stock-spec branches below (including
+        # upstream's `turboquant_*` path).
+        spec_kind = "sliding_window" if self.sliding_window is not None else "full"
+        custom_spec_cls = self.attn_backend.get_kv_cache_spec_class(spec_kind)
+        if custom_spec_cls is not None:
+            if self.sliding_window is not None:
+                assert not vllm_config.model_config.use_mla, (
+                    "MLA is not supported for slidingwindow"
+                )
+                return custom_spec_cls(
+                    block_size=block_size,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                    head_size_v=self.head_size_v,
+                    dtype=self.kv_cache_torch_dtype,
+                    sliding_window=self.sliding_window,
+                )
+            return custom_spec_cls(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=self.kv_cache_torch_dtype,
+            )
         if self.sliding_window is not None:
             assert not self.attn_backend.is_mla(), (
                 "MLA is not supported for sliding window"

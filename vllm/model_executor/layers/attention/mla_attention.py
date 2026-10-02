@@ -1163,6 +1163,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 **common_kwargs,
                 sliding_window=self.sliding_window,
             )
+        # Backend-declared MLA spec class takes precedence. Plugin
+        # backends override get_kv_cache_spec_class("mla") to return
+        # their compressed-MLA spec; default falls through to stock
+        # MLAAttentionSpec. The hook declares only the "mla" kind, so a
+        # sliding-window MLA layer above keeps the stock spec.
+        custom_spec_cls = self.attn_backend.get_kv_cache_spec_class("mla")
+        if custom_spec_cls is not None:
+            return custom_spec_cls(**common_kwargs)
         return MLAAttentionSpec(
             **common_kwargs,
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
@@ -2528,6 +2536,16 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
 
     _use_flashinfer_concat_mla_k: bool
 
+    def _get_gather_op(self):
+        """Return the gather/dequant op used by chunked-context prefill.
+
+        Default: vLLM's stock `ops.gather_and_maybe_dequant_cache`. Plugin
+        impls (e.g. TkvMLAImpl) override this to provide a TQ-aware
+        gather that dequantizes their packed KV format on read. The op
+        signature must match `ops.gather_and_maybe_dequant_cache`.
+        """
+        return ops.gather_and_maybe_dequant_cache
+
     def __init__(
         self,
         num_heads: int,
@@ -2607,6 +2625,12 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         if use_fp8_prefill:
             q = q.to(prefill_metadata.q_data_type)
 
+        # Backend/impl-overridable gather op. Plugin impls (TQ-MLA, etc.)
+        # return their own gather-dequant function; default returns
+        # vLLM's stock custom op. Avoids the need for plugins to monkey-
+        # patch ops.gather_and_maybe_dequant_cache at module level.
+        gather_op = self._get_gather_op()
+
         output = None
         output_lse = None
         for chunk in chunked_context.chunks:
@@ -2622,7 +2646,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                     seq_starts=chunk.starts,
                 )
             elif not use_fp8_prefill:
-                ops.gather_and_maybe_dequant_cache(
+                gather_op(
                     src_cache=kv_c_and_k_pe_cache,
                     dst=workspace,
                     block_table=block_table,

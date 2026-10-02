@@ -36,6 +36,10 @@ from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
     sparse_mla_triton_warmup,
 )
+from vllm.model_executor.warmup.spec_decode_warmup import (
+    spec_decode_prep_kernel_warmup,
+)
+from vllm.model_executor.warmup.turbo_attn_warmup import turbo_attn_prefill_warmup
 from vllm.model_executor.warmup.v1_block_table_warmup import (
     warm_v1_block_table_kernels,
 )
@@ -202,6 +206,10 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
             force_attention=True,
             create_mixed_batch=True,
         )
+
+    turbo_attn_prefill_warmup(worker)
+
+    spec_decode_prep_kernel_warmup(worker)
 
 
 def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:
