@@ -84,7 +84,7 @@ def is_plugin_cache_dtype(name: str) -> bool:
     """Return True if ``name`` was registered via ``register_cache_dtype``.
 
     Used by arg post-processing to auto-default ``--attention-backend`` to
-    ``CUSTOM`` when the user selects a plugin-registered KV cache dtype.
+    ``TURBO_ATTN`` when the user selects a plugin-registered KV cache dtype.
     """
     return name in _PLUGIN_CACHE_DTYPES
 

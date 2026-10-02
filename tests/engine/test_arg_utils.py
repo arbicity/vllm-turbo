@@ -889,9 +889,12 @@ class TestDpDeviceIdSharding:
             )
 
 
-def test_plugin_kv_cache_dtype_auto_selects_custom_attention_backend():
+def test_plugin_kv_cache_dtype_auto_selects_turbo_attn_backend():
     """A plugin-registered kv-cache dtype should auto-default the attention
-    backend to CUSTOM, but only when the user did not pass an explicit choice.
+    backend to TURBO_ATTN (the slot such plugins register into), but only when
+    the user did not pass an explicit choice. The worker's load-time lifecycle
+    hooks dispatch only to a named backend, so without this a
+    ``--kv-cache-dtype tkv`` boot never ran the plugin's ``on_model_loaded``.
     """
     import torch
 
@@ -907,7 +910,7 @@ def test_plugin_kv_cache_dtype_auto_selects_custom_attention_backend():
     try:
         parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
 
-        # 1. Plugin dtype + no --attention-backend → CUSTOM auto-selected.
+        # 1. Plugin dtype + no --attention-backend → TURBO_ATTN auto-selected.
         args = parser.parse_args(
             [
                 "--model",
@@ -919,7 +922,7 @@ def test_plugin_kv_cache_dtype_auto_selects_custom_attention_backend():
         engine_args = EngineArgs.from_cli_args(args)
         vllm_config = engine_args.create_engine_config()
         assert vllm_config.attention_config.backend == (
-            AttentionBackendEnum.CUSTOM
+            AttentionBackendEnum.TURBO_ATTN
         )
 
         # 2. Plugin dtype + explicit --attention-backend → user choice honoured.

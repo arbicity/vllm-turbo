@@ -73,6 +73,7 @@ from vllm.config.cache import (
     MambaCacheMode,
     MambaDType,
     PrefixCachingHashAlgo,
+    is_plugin_cache_dtype,
 )
 from vllm.config.device import Device
 from vllm.config.kernel import IrOpPriorityConfig, LinearBackend, MoEBackend
@@ -2404,6 +2405,28 @@ class EngineArgs:
             # Reuse the validator to handle "auto" and string-to-enum conversion
             attention_config.backend = AttentionConfig.validate_backend_before(
                 self.attention_backend
+            )
+
+        # Plugin-registered KV cache dtypes (e.g. tkv) ship their own
+        # AttentionBackend, registered under AttentionBackendEnum.TURBO_ATTN
+        # via register_backend(). When the user selects such a dtype without
+        # --attention-backend, default to TURBO_ATTN: the platform would pick
+        # it anyway, but only a NAMED backend reaches the lifecycle hooks the
+        # worker dispatches before its attention groups exist
+        # (gpu_worker._backends_in_use -> on_model_loaded, adjust_kv_budget;
+        # kv_cache_manager -> on_kv_manager_created). An explicit choice
+        # (--attention-backend or --attention-config.backend) is honoured.
+        if attention_config.backend is None and is_plugin_cache_dtype(
+            resolved_cache_dtype
+        ):
+            from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+            attention_config.backend = AttentionBackendEnum.TURBO_ATTN
+            logger.info(
+                "Auto-selecting attention backend TURBO_ATTN for "
+                "plugin-registered kv-cache dtype %r. Pass "
+                "--attention-backend to override.",
+                resolved_cache_dtype,
             )
 
         # TurboQuant requires FlashAttention 2 — FA3 boundary layers assert
