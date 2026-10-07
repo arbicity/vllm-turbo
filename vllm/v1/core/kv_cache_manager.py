@@ -9,6 +9,7 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
@@ -195,6 +196,8 @@ class KVCacheManager:
                     manager.shared_prefix_checkpoint = True
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
+        # The O(1) state groups' pool, when they have their own; None otherwise.
+        self.mamba_block_pool = self.coordinator.mamba_block_pool
         self.retained_hit_group_ids = tuple(
             manager.kv_cache_group_id
             for manager in self.coordinator.single_type_managers
@@ -231,7 +234,26 @@ class KVCacheManager:
             The KV cache usage (between 0.0 and 1.0).
 
         """
-        return self.block_pool.get_usage()
+        return max(pool.get_usage() for pool in self.coordinator.block_pools)
+
+    def _fits(
+        self,
+        needed: dict[BlockPool, int],
+        watermark_blocks: int,
+        reserved_blocks: int = 0,
+    ) -> bool:
+        """Whether every pool has the blocks ``needed`` from it. The watermark
+        and the in-flight reservation are counted in main-pool blocks."""
+        if self.mamba_block_pool is None:
+            return sum(needed.values()) + watermark_blocks <= (
+                self.block_pool.get_num_free_blocks() - reserved_blocks
+            )
+        mamba_needed = needed.pop(self.mamba_block_pool, 0)
+        if mamba_needed > self.mamba_block_pool.get_num_free_blocks():
+            return False
+        return sum(needed.values()) + watermark_blocks <= (
+            self.block_pool.get_num_free_blocks() - reserved_blocks
+        )
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -520,7 +542,7 @@ class KVCacheManager:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
-            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+            needed = self.coordinator.get_num_blocks_to_allocate_per_pool(
                 request_id=request.request_id,
                 num_tokens=full_num_tokens,
                 new_computed_blocks=new_computed_block_list,
@@ -531,8 +553,7 @@ class KVCacheManager:
                 apply_admission_cap=True,
                 prefill_end=prefill_end,
             )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
+            if not self._fits(needed, watermark_blocks):
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -555,7 +576,7 @@ class KVCacheManager:
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
-        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+        needed = self.coordinator.get_num_blocks_to_allocate_per_pool(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
@@ -569,9 +590,7 @@ class KVCacheManager:
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
-        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        required_blocks = num_blocks_to_allocate + watermark_blocks
-        if required_blocks > available_blocks:
+        if not self._fits(needed, watermark_blocks, reserved_blocks):
             # Cannot allocate new blocks
             return None
 
@@ -726,7 +745,11 @@ class KVCacheManager:
             A list of KV cache events.
 
         """
-        events = self.block_pool.take_events()
+        events = [
+            event
+            for pool in self.coordinator.block_pools
+            for event in pool.take_events()
+        ]
         for event in events:
             if not isinstance(event, BlockStored):
                 continue
@@ -898,10 +921,16 @@ class KVCacheManager:
         pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
         for mgr in self.coordinator.single_type_managers:
             pending_copies.extend(mgr.take_pending_cow_copies())
+        # Mamba-pool block ids are shifted past the main pool's, so the worker
+        # can tell which pool's caches a copy belongs to (KVCacheConfig
+        # .mamba_pool_offset); the two pools' ids otherwise collide.
+        num_main = self.kv_cache_config.num_blocks
         copies = [
             KVCacheBlockCopy(
-                src_block_id=source_block.block_id,
-                dst_block_id=cow_block.block_id,
+                src_block_id=source_block.block_id
+                + (num_main if source_block.pool is self.mamba_block_pool else 0),
+                dst_block_id=cow_block.block_id
+                + (num_main if cow_block.pool is self.mamba_block_pool else 0),
             )
             for source_block, cow_block in pending_copies
         ]

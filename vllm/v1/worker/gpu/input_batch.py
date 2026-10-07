@@ -224,7 +224,7 @@ def set_dummy_context(
     input_batch: InputBatch,
     block_tables: "BlockTables",
     context_len: int,
-    num_kv_blocks: int,
+    num_kv_blocks: int | Sequence[int],
     max_model_len: int,
     input_block_tables: Sequence[torch.Tensor] | None = None,
 ) -> None:
@@ -252,17 +252,22 @@ def set_dummy_context(
     input_batch.positions.copy_(torch.from_numpy(local_pos + context_len))
 
     seq_len = context_len + query_len
-    for block_table, block_size, bpk in zip(
+    # One count for all groups, or each group's own pool (a separate mamba
+    # pool is far smaller than the main one).
+    if isinstance(num_kv_blocks, int):
+        num_kv_blocks = [num_kv_blocks] * len(input_block_tables)
+    for block_table, block_size, bpk, group_num_blocks in zip(
         input_block_tables,
         block_tables.kernel_block_sizes,
         block_tables.blocks_per_kv_block,
+        num_kv_blocks,
     ):
         num_blocks = min(cdiv(seq_len, block_size), block_table.shape[1])
         # Spans are disjoint until the pool runs out, then they wrap and share
         # blocks: profiling only needs the reads to be realistic, not distinct.
         block_ids = torch.arange(
             num_reqs * num_blocks, dtype=block_table.dtype, device=block_table.device
-        ) % (num_kv_blocks * bpk)
+        ) % (group_num_blocks * bpk)
         block_table[:num_reqs, :num_blocks] = block_ids.view(num_reqs, num_blocks)
 
 

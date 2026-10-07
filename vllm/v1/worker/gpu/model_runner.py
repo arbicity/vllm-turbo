@@ -175,6 +175,7 @@ from vllm.v1.worker.utils import (
     clear_layer_kv_caches,
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
+    mamba_pool_layout,
 )
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
@@ -1231,6 +1232,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_caches,
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
+                mamba_pool=mamba_pool_layout(self.kv_cache_config),
             )
 
     def gather_batch_req_state(
@@ -1821,7 +1823,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         input_batch,
                         self.block_tables,
                         context_len,
-                        self.kv_cache_config.num_blocks,
+                        [
+                            self.kv_cache_config.group_num_blocks(group_id)
+                            for group_id in range(
+                                len(self.kv_cache_config.kv_cache_groups)
+                            )
+                        ],
                         self.max_model_len,
                         input_block_tables=block_tables,
                     )

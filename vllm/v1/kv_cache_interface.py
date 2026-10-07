@@ -213,6 +213,24 @@ class KVCacheSpec:
     def block_table_token_alignment(self) -> int | None:
         return 128
 
+    @property
+    def aggregated_layer_count(self) -> int:
+        """How many model layers one page of this spec already covers.
+
+        Default 1: a page holds one layer's tokens, so a group of N layers
+        needs N pages per block.
+
+        A spec may instead FUSE several layers into one shared page: the
+        layers occupy disjoint byte ranges of the same page, and
+        ``page_size_bytes`` is the SUM of their per-layer pages (the tkv
+        composite spec for per-layer KV bit widths). Such a spec returns the
+        number of layers fused, and its group of N layers then needs
+        N / aggregated_layer_count pages per block, every fused layer viewing
+        the same bytes. Charging the summed page once per layer would cut the
+        usable KV capacity by this factor.
+        """
+        return 1
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         """The maximum possible memory usage of this KV cache in bytes.
 
@@ -1436,6 +1454,9 @@ class KVCacheTensor:
     block_stride: int
     offset: int = 0  # byte offset of layers[0]'s block 0
     host_resident: bool = False
+    # Blocks of the pool backing these layers, when it is not the main pool
+    # (KVCacheConfig.mamba_pool_num_blocks). None: the main pool.
+    num_blocks: int | None = None
 
 
 class KVCacheGroupRole(str, Enum):
@@ -1496,6 +1517,34 @@ class KVCacheConfig:
 
     kv_tp_replicas: int = 1
     """Consecutive TP ranks holding identical KV for every layer (1: none)."""
+
+    mamba_pool_num_blocks: int | None = None
+    """Blocks of the separate pool the O(1) state groups (Mamba/GDN) draw
+    from. None: every group shares the main pool of ``num_blocks`` blocks.
+
+    A hybrid model's recurrent layers need a fixed number of blocks per
+    running request, never one per token. Sharing the attention pool sizes
+    their tensors for ``num_blocks`` blocks and unifies their page with the
+    attention page, which spends most of the KV budget on state no request
+    can use. A separate pool sized for ``max_num_seqs`` leaves the rest to
+    attention."""
+
+    mamba_pool_offset: int | None = None
+    """Byte offset of the separate pool's region in the backing allocation;
+    every view at or above it belongs to that pool."""
+
+    def uses_mamba_pool(self, group_id: int) -> bool:
+        """Whether cache group ``group_id`` draws from the separate pool."""
+        return self.mamba_pool_num_blocks is not None and isinstance(
+            self.kv_cache_groups[group_id].kv_cache_spec, MambaSpec
+        )
+
+    def group_num_blocks(self, group_id: int) -> int:
+        """Blocks of the pool cache group ``group_id`` draws from."""
+        if self.uses_mamba_pool(group_id):
+            assert self.mamba_pool_num_blocks is not None
+            return self.mamba_pool_num_blocks
+        return self.num_blocks
 
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:
@@ -1560,6 +1609,8 @@ class KVCacheConfig:
 
     def num_blocks_of(self, tensor: KVCacheTensor) -> int:
         """Number of blocks addressable by the pool backing ``tensor``."""
+        if tensor.num_blocks is not None:
+            return tensor.num_blocks
         if not tensor.host_resident:
             return self.num_blocks
         assert self.hisparse_host_num_blocks is not None

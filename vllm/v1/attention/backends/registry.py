@@ -149,6 +149,11 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     CPU_MLA = "vllm.v1.attention.backends.mla.cpu_mla.CPUMLABackend"
     AMX_MLA = "vllm.v1.attention.backends.mla.amx_mla.AMXMLABackend"
     TURBOQUANT = "vllm.v1.attention.backends.turboquant_attn.TurboQuantAttentionBackend"
+    # Turbo Attention (https://github.com/arbicity/turbo-attn), paired with
+    # ``--kv-cache-dtype tkv``. The ``turbo-attn`` plugin registers it via
+    # ``register_backend(AttentionBackendEnum.TURBO_ATTN, ...)``. A distinct
+    # value: a second ``None`` member would make CUSTOM an alias of this one.
+    TURBO_ATTN = "tkv.integrations.vllm.backend_class.TkvAttentionBackend"
     # Placeholder for third-party/custom backends - must be registered before use
     # set to None to avoid alias with other backend, whose value is an empty string
     CUSTOM = None

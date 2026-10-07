@@ -250,6 +250,7 @@ if TYPE_CHECKING:
         Literal["LBNHC", "LBHNC", "LHBNC", "NHD", "HND", "BLHNC", "BLNHC", "BHLNC"]
         | None
     ) = None
+    VLLM_SAMPLER_RESERVE_MIB: int = 0
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_RAISE_ON_LOGIT_NANS: bool = False
@@ -1835,6 +1836,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         None,
         ["LBNHC", "LBHNC", "LHBNC", "NHD", "HND", "BLHNC", "BLNHC", "BHLNC"],
     ),
+    # Sampler-warmup headroom (MiB) a hybrid model's split KV layout keeps free
+    # after allocating the KV cache. 0 = estimate it from the vocab size and
+    # max_num_seqs.
+    "VLLM_SAMPLER_RESERVE_MIB": lambda: int(os.getenv("VLLM_SAMPLER_RESERVE_MIB", "0")),
     # SSM conv state layout used for Mamba models.
     # - SD: (state_len, dim) — dim contiguous (default)
     # - DS: (dim, state_len) — TP-sharded dim on dim1,
