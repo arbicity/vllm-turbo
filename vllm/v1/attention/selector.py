@@ -121,6 +121,7 @@ def get_attn_backend(
     """Selects which attention backend to use and lazily imports it."""
     if kv_cache_dtype is not None:
         from vllm.config.cache import validate_cache_dtype
+
         # Raises ValueError with a clear message if the dtype isn't
         # builtin or plugin-registered.
         validate_cache_dtype(kv_cache_dtype)
@@ -215,6 +216,7 @@ def _mla_wrapper_cls(backend) -> "type[AttentionBackend] | None":
 
     Returns:
         The backend class, or None if it is unimportable or not a wrapper.
+
     """
     try:
         cls = backend.get_class()
@@ -242,6 +244,7 @@ def _mla_wrapper_for_dtype(
 
     Returns:
         The wrapper backend class, or None when no plugin claims the dtype.
+
     """
     if kv_cache_dtype is None or kv_cache_dtype == "auto":
         return None

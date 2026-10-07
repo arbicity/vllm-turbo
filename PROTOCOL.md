@@ -101,6 +101,40 @@ per N layers in each block (`get_tensor_slots`) and gives every fused layer a
 view of that same page. Without it the summed page is charged once per layer
 and usable capacity drops N-fold.
 
+### Separate state pool for hybrid models — `vllm/v1/core/`, `vllm/v1/worker/`
+
+A hybrid model's O(1) recurrent layers (Mamba/GDN) hold a fixed number of
+blocks per running request, never one per token. Upstream puts them in the
+attention pool: every recurrent layer gets a tensor of `num_blocks` state
+pages and its page is unified with the attention page, which spends most of
+the KV budget on state no request can use (Qwen3.5-0.8B at 10 GB: 5,728
+tokens shared vs 355,696 split; turbo-attn ATTRIBUTION §7.3).
+
+The seam gives those groups their own pool when it is safe to
+(`_mamba_pool_eligible`: Mamba cache mode `none`/`align`, no HiSparse, no KV
+connector, no context parallelism, no hidden-state layers):
+
+- **Planning** (`kv_cache_utils.py`): the recurrent pages are not unified
+  with attention (attention layers are unified among themselves); the state
+  pool is sized `max_num_seqs * sum(per-request blocks per group) + 1` and,
+  with a sampler-warmup reserve (`VLLM_SAMPLER_RESERVE_MIB`), comes off the
+  budget before attention is planned, so auto-fit, the override and the
+  admission check all see only the attention pool. The two pools are two
+  regions of the one backing allocation, each laid out exactly as upstream
+  lays out a shared pool (`_layout_kv_cache_tensors`), so groups within a
+  pool still overlay each other and the pools never alias.
+  `KVCacheConfig.mamba_pool_num_blocks` / `mamba_pool_offset`,
+  `KVCacheTensor.num_blocks`.
+- **Scheduler** (`kv_cache_coordinator.py`, `kv_cache_manager.py`): a second
+  `BlockPool` for the recurrent groups; admission checks each pool against its
+  own free blocks (watermark and reservations count main-pool blocks);
+  events and usage cover both. Frees route by `KVCacheBlock.pool`, which
+  upstream already does.
+- **Worker** (`worker/utils.py`, `worker/gpu/*`): the two pools' block ids
+  overlap, so CoW copies carry state-pool ids shifted past `num_blocks` and
+  apply only to the caches in that pool's region; profiling dummy contexts
+  and warmup number each pool's blocks separately.
+
 ---
 
 ## Sync workflow when moving to a new upstream release
@@ -113,7 +147,7 @@ and usable capacity drops N-fold.
    extension point that covers a hook, move the capability into the plugin
    and drop the hook.
 3. `pytest tests/v1/core/test_kv_seam_invariants.py
-   tests/v1/core/test_aggregated_layer_count.py
+   tests/v1/core/test_aggregated_layer_count.py tests/v1/core/test_mamba_pool.py
    tests/v1/attention/test_mla_wrapper_selection.py
    tests/v1/worker/test_gpu_worker.py -k hook
    tests/engine/test_arg_utils.py -k plugin_kv_cache_dtype` (CPU).

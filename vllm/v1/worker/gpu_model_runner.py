@@ -234,6 +234,7 @@ from .utils import (
     allocate_kv_cache,
     bind_kv_cache,
     copy_kv_cache_blocks_inplace,
+    mamba_pool_layout,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
 )
@@ -1225,6 +1226,7 @@ class GPUModelRunner(
                 self.kv_caches,
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
+                mamba_pool=mamba_pool_layout(self.kv_cache_config),
             )
 
         # Free the cached encoder outputs.

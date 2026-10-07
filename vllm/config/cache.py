@@ -80,17 +80,17 @@ def register_cache_dtype(name: str, torch_dtype) -> None:
     STR_DTYPE_TO_TORCH_DTYPE.
     """
     from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+
     _PLUGIN_CACHE_DTYPES.add(name)
     STR_DTYPE_TO_TORCH_DTYPE[name] = torch_dtype
 
 
 def validate_cache_dtype(name: str) -> str:
-    """argparse ``type=`` callable. Validates against builtins + plugins."""
+    """Argparse ``type=`` callable. Validates against builtins + plugins."""
     allowed = _BUILTIN_CACHE_DTYPES | _PLUGIN_CACHE_DTYPES
     if name not in allowed:
         raise ValueError(
-            f"Unknown --kv-cache-dtype {name!r}. "
-            f"Allowed: {sorted(allowed)}"
+            f"Unknown --kv-cache-dtype {name!r}. Allowed: {sorted(allowed)}"
         )
     return name
 

@@ -1081,9 +1081,7 @@ def test_plugin_kv_cache_dtype_auto_selects_turbo_attn_backend():
         )
         engine_args = EngineArgs.from_cli_args(args)
         vllm_config = engine_args.create_engine_config()
-        assert vllm_config.attention_config.backend == (
-            AttentionBackendEnum.TURBO_ATTN
-        )
+        assert vllm_config.attention_config.backend == (AttentionBackendEnum.TURBO_ATTN)
 
         # 2. Plugin dtype + explicit --attention-backend → user choice honoured.
         args = parser.parse_args(
@@ -1098,9 +1096,7 @@ def test_plugin_kv_cache_dtype_auto_selects_turbo_attn_backend():
         )
         engine_args = EngineArgs.from_cli_args(args)
         vllm_config = engine_args.create_engine_config()
-        assert vllm_config.attention_config.backend == (
-            AttentionBackendEnum.FLASH_ATTN
-        )
+        assert vllm_config.attention_config.backend == (AttentionBackendEnum.FLASH_ATTN)
 
         # 3. Builtin dtype "auto" → no auto-override (stays None).
         args = parser.parse_args(

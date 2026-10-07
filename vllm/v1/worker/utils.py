@@ -688,12 +688,44 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
                 layer.impl._v_scale_cache = None
 
 
+def mamba_pool_layout(kv_cache_config: KVCacheConfig) -> tuple[int, int] | None:
+    """``(byte offset, blocks)`` of the separate mamba pool's region, or None."""
+    if kv_cache_config.mamba_pool_num_blocks is None:
+        return None
+    assert kv_cache_config.mamba_pool_offset is not None
+    return kv_cache_config.mamba_pool_offset, kv_cache_config.mamba_pool_num_blocks
+
+
 def copy_kv_cache_blocks_inplace(
     kv_caches: Iterable[torch.Tensor],
     num_blocks: int,
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
+    mamba_pool: tuple[int, int] | None = None,
 ) -> None:
+    """Apply the scheduler's block copies to every cache.
+
+    With a separate mamba pool (``mamba_pool_layout``), copy ids at or above
+    ``num_blocks`` name blocks of that pool (the scheduler shifts them), and
+    apply only to the caches whose views lie in its region of the backing
+    allocation; the rest apply to the main pool's caches.
+    """
     if not kv_cache_block_copies:
+        return
+    if mamba_pool is not None:
+        region_start, mamba_num_blocks = mamba_pool
+        main_caches: list[torch.Tensor] = []
+        mamba_caches: list[torch.Tensor] = []
+        for cache in kv_caches:
+            in_mamba = cache.storage_offset() * cache.element_size() >= region_start
+            (mamba_caches if in_mamba else main_caches).append(cache)
+        main_copies = [c for c in kv_cache_block_copies if c[0] < num_blocks]
+        mamba_copies = [
+            KVCacheBlockCopy(c[0] - num_blocks, c[1] - num_blocks)
+            for c in kv_cache_block_copies
+            if c[0] >= num_blocks
+        ]
+        copy_kv_cache_blocks_inplace(main_caches, num_blocks, main_copies)
+        copy_kv_cache_blocks_inplace(mamba_caches, mamba_num_blocks, mamba_copies)
         return
 
     indices_np = np.array(kv_cache_block_copies, dtype=np.int64)

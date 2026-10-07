@@ -935,9 +935,7 @@ class Worker(WorkerBase):
         # for backends that don't define the hook.
         _backends = _backends_in_use(self)
         for _backend_cls in _backends:
-            _call_backend_hook(
-                _backend_cls, "on_kv_cache_initialized", _backends, self
-            )
+            _call_backend_hook(_backend_cls, "on_kv_cache_initialized", _backends, self)
 
         warmup_sizes: list[int] = []
 

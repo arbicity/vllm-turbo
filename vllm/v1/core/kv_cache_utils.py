@@ -1104,7 +1104,10 @@ def get_max_concurrency_for_kv_cache_config(
     """
     num_blocks_per_request = 0
     host_blocks_per_request = 0
-    for group in kv_cache_config.kv_cache_groups:
+    for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+        if kv_cache_config.uses_mamba_pool(group_id):
+            # Sized for every running request; never the token limit.
+            continue
         required = cdiv(
             group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
             group.kv_cache_spec.page_size_bytes,
@@ -1686,6 +1689,247 @@ def validate_kv_cache_layout(
         )
 
 
+def _layout_kv_cache_tensors(
+    kv_cache_groups: list[KVCacheGroupSpec],
+    num_blocks: int,
+    bytes_per_block: int,
+    layout: "KVCacheLayout",
+    size: int,
+    base_offset: int = 0,
+    pool_num_blocks: int | None = None,
+) -> list[KVCacheTensor]:
+    """Place ``kv_cache_groups`` in one region of the backing allocation.
+
+    The region starts ``base_offset`` bytes in and holds ``num_blocks`` blocks
+    of ``bytes_per_block``; ``size`` is the whole backing allocation.
+    ``pool_num_blocks`` tags the tensors of a pool other than the main one.
+    """
+    interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None
+
+    # Groups alias from byte 0. Spec regions are laid out differently:
+    #
+    # block-outer (the same packing repeats for every block):
+    # group 0: | blk 0 [ A | B  | pad ] | blk 1 [ A | B  | pad ] | ...
+    # group 1: | blk 0 [  C  |    D   ] | blk 1 [  C  |    D   ] | ...
+    #          |<--- bytes_per_block -->|
+    #
+    # layer-outer (only supported for uniform page sizes or single-group models):
+    # group 0: | A [ blk 0 | blk 1 | ... ] | B [ blk 0 | blk 1 | ... ] |
+    # group 1: | C [ blk 0 | blk 1 | ... ] | D [ blk 0 | blk 1 | ... ] |
+
+    kv_cache_tensors = []
+    for group in kv_cache_groups:
+        group_spec = group.kv_cache_spec
+        layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
+        if isinstance(group_spec, UniformTypeKVCacheSpecs):
+            for layer_name, spec in group_spec.kv_cache_specs.items():
+                layers_by_spec[spec].append(layer_name)
+        elif group.layer_names:
+            layers_by_spec[group_spec].extend(group.layer_names)
+
+        byte_offset = 0
+        for spec, layer_names in layers_by_spec.items():
+            agg = spec.aggregated_layer_count
+            # Layers fused into one shared page take one page slot per fused
+            # set (see get_tensor_slots); every layer of a set views it.
+            num_slots = len(layer_names) // agg if agg > 1 else len(layer_names)
+            layer_stride, block_stride, _, _, _ = compute_layout_strides(
+                spec,
+                num_blocks,
+                num_slots,
+                layout,
+                fixed_strides=(None, interleaved_block_stride, None, None, None),
+            )
+            offset = (
+                byte_offset
+                * max(layer_stride, spec.page_size_bytes)
+                // spec.page_size_bytes
+            )
+            if agg > 1:
+                for slot, slot_layers in enumerate(
+                    get_tensor_slots(KVCacheGroupSpec(layer_names, spec))
+                ):
+                    kv_cache_tensors.extend(
+                        KVCacheTensor(
+                            size=size,
+                            layers=[layer_name],
+                            layer_stride=layer_stride,
+                            block_stride=block_stride,
+                            offset=base_offset + offset + slot * layer_stride,
+                            num_blocks=pool_num_blocks,
+                        )
+                        for layer_name in slot_layers
+                    )
+            else:
+                kv_cache_tensors.append(
+                    KVCacheTensor(
+                        size=size,
+                        layers=layer_names,
+                        layer_stride=layer_stride,
+                        block_stride=block_stride,
+                        offset=base_offset + offset,
+                        num_blocks=pool_num_blocks,
+                    )
+                )
+            byte_offset += num_slots * spec.page_size_bytes
+
+    return kv_cache_tensors
+
+
+def _mamba_pool_eligible(
+    vllm_config: VllmConfig, kv_cache_specs: Iterable[KVCacheSpec]
+) -> bool:
+    """Whether the O(1) state layers get their own pool (see
+    ``KVCacheConfig.mamba_pool_num_blocks``).
+
+    Needs both kinds of layer, a Mamba cache mode with a per-request bound
+    ("none" or "align"), and none of the features that address blocks
+    across groups by a single id space: HiSparse host pools, KV transfer
+    connectors, context parallelism, and hidden-state cache layers.
+    """
+    specs = list(kv_cache_specs)
+    if not any(isinstance(s, MambaSpec) and s.mamba_cache_mode != "all" for s in specs):
+        return False
+    if not any(not isinstance(s, MambaSpec) for s in specs):
+        return False
+    if any(isinstance(s, (HiddenStateCacheSpec, HiSparseHotSpec)) for s in specs):
+        return False
+    parallel_config = vllm_config.parallel_config
+    return (
+        vllm_config.cache_config.mamba_cache_mode != "all"
+        and vllm_config.attention_config.hisparse_config is None
+        and vllm_config.kv_transfer_config is None
+        and parallel_config.decode_context_parallel_size == 1
+        and parallel_config.prefill_context_parallel_size == 1
+    )
+
+
+def _split_mamba_pool_groups(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> tuple[list[KVCacheGroupSpec], list[KVCacheGroupSpec]] | None:
+    """``(main-pool groups, mamba-pool groups)``, or None for one shared pool."""
+    if any(group.host_resident for group in kv_cache_groups):
+        return None
+    if _glm5_next_tensor_layout(kv_cache_groups) is not None:
+        return None
+    if not _mamba_pool_eligible(
+        vllm_config, (group.kv_cache_spec for group in kv_cache_groups)
+    ):
+        return None
+    mamba_groups = [
+        group for group in kv_cache_groups if isinstance(group.kv_cache_spec, MambaSpec)
+    ]
+    main_groups = [
+        group
+        for group in kv_cache_groups
+        if not isinstance(group.kv_cache_spec, MambaSpec)
+    ]
+    return main_groups, mamba_groups
+
+
+def _mamba_pool_num_blocks(
+    vllm_config: VllmConfig, mamba_groups: list[KVCacheGroupSpec]
+) -> int:
+    """Blocks for every running request's state in every mamba group, plus
+    the null block. A request holds at most ``max_memory_usage_bytes`` of a
+    group's state whatever its length, and at most ``max_num_seqs`` run."""
+    per_request = sum(
+        cdiv(
+            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+            group.kv_cache_spec.page_size_bytes,
+        )
+        for group in mamba_groups
+    )
+    return vllm_config.scheduler_config.max_num_seqs * per_request + 1
+
+
+def _sampler_reserve_bytes(vllm_config: VllmConfig) -> int:
+    """Headroom for the sampler warmup that runs after the KV cache is
+    allocated. Its O(max_num_seqs * vocab) tensors were freed before the
+    profiler handed over the budget, and a compressed pool leaves no
+    rounding slack to absorb them. ``VLLM_SAMPLER_RESERVE_MIB`` overrides
+    the estimate (vocab * max_num_seqs * 8 bytes * 5 tensors)."""
+    if envs.VLLM_SAMPLER_RESERVE_MIB:
+        return envs.VLLM_SAMPLER_RESERVE_MIB * 1024 * 1024
+    try:
+        vocab = vllm_config.model_config.get_vocab_size()
+    except (AttributeError, ValueError):
+        return 512 * 1024 * 1024
+    return vocab * vllm_config.scheduler_config.max_num_seqs * 8 * 5
+
+
+def _mamba_pool_fixed_bytes(
+    vllm_config: VllmConfig, mamba_groups: list[KVCacheGroupSpec]
+) -> int:
+    """Bytes the split layout takes off the budget before attention: the
+    mamba pool and the sampler headroom."""
+    return _mamba_pool_num_blocks(
+        vllm_config, mamba_groups
+    ) * _get_kv_cache_bytes_per_block(mamba_groups) + _sampler_reserve_bytes(
+        vllm_config
+    )
+
+
+def _get_split_pool_kv_cache_config(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    main_groups: list[KVCacheGroupSpec],
+    mamba_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> KVCacheConfig:
+    """Lay the main pool and the mamba pool out as two regions.
+
+    Each region is placed exactly as one shared pool would place its groups
+    (``_layout_kv_cache_tensors``): the main pool's groups overlay each other
+    over ``num_blocks`` blocks, the mamba groups over the mamba pool's. The
+    mamba region follows the main one in the same backing allocation, so the
+    two never alias and a block id means a block of its own pool.
+    """
+    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    validate_kv_cache_layout(layout, main_groups)
+    validate_kv_cache_layout(layout, mamba_groups)
+    main_bytes_per_block = _get_kv_cache_bytes_per_block(main_groups)
+    mamba_bytes_per_block = _get_kv_cache_bytes_per_block(mamba_groups)
+    mamba_num_blocks = _mamba_pool_num_blocks(vllm_config, mamba_groups)
+
+    main_memory = available_memory - _mamba_pool_fixed_bytes(vllm_config, mamba_groups)
+    num_blocks = max(main_memory, 0) // main_bytes_per_block
+    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+
+    main_bytes = main_bytes_per_block * num_blocks
+    size = main_bytes + mamba_bytes_per_block * mamba_num_blocks
+    kv_cache_tensors = _layout_kv_cache_tensors(
+        main_groups, num_blocks, main_bytes_per_block, layout, size
+    ) + _layout_kv_cache_tensors(
+        mamba_groups,
+        mamba_num_blocks,
+        mamba_bytes_per_block,
+        layout,
+        size,
+        base_offset=main_bytes,
+        pool_num_blocks=mamba_num_blocks,
+    )
+    logger.info_once(
+        "Separate state pool for %d Mamba group(s): %d blocks (%s GiB); "
+        "%d blocks for the other %d group(s).",
+        len(mamba_groups),
+        mamba_num_blocks,
+        format_gib(mamba_bytes_per_block * mamba_num_blocks),
+        num_blocks,
+        len(main_groups),
+    )
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=kv_cache_tensors,
+        kv_cache_groups=kv_cache_groups,
+        prefix_cache_retention_interval=(
+            vllm_config.cache_config.prefix_cache_retention_interval
+        ),
+        mamba_pool_num_blocks=mamba_num_blocks,
+        mamba_pool_offset=main_bytes,
+    )
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1783,79 +2027,21 @@ def get_kv_cache_config_from_groups(
             ),
         )
 
+    if (split := _split_mamba_pool_groups(vllm_config, kv_cache_groups)) is not None:
+        return _get_split_pool_kv_cache_config(
+            vllm_config, kv_cache_groups, *split, available_memory
+        )
+
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
     validate_kv_cache_layout(layout, kv_cache_groups)
     bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
-    interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None
 
     num_blocks = available_memory // bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     size = bytes_per_block * num_blocks
-
-    # Groups alias from byte 0. Spec regions are laid out differently:
-    #
-    # block-outer (the same packing repeats for every block):
-    # group 0: | blk 0 [ A | B  | pad ] | blk 1 [ A | B  | pad ] | ...
-    # group 1: | blk 0 [  C  |    D   ] | blk 1 [  C  |    D   ] | ...
-    #          |<--- bytes_per_block -->|
-    #
-    # layer-outer (only supported for uniform page sizes or single-group models):
-    # group 0: | A [ blk 0 | blk 1 | ... ] | B [ blk 0 | blk 1 | ... ] |
-    # group 1: | C [ blk 0 | blk 1 | ... ] | D [ blk 0 | blk 1 | ... ] |
-
-    kv_cache_tensors = []
-    for group in kv_cache_groups:
-        group_spec = group.kv_cache_spec
-        layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
-        if isinstance(group_spec, UniformTypeKVCacheSpecs):
-            for layer_name, spec in group_spec.kv_cache_specs.items():
-                layers_by_spec[spec].append(layer_name)
-        elif group.layer_names:
-            layers_by_spec[group_spec].extend(group.layer_names)
-
-        byte_offset = 0
-        for spec, layer_names in layers_by_spec.items():
-            agg = spec.aggregated_layer_count
-            # Layers fused into one shared page take one page slot per fused
-            # set (see get_tensor_slots); every layer of a set views it.
-            num_slots = len(layer_names) // agg if agg > 1 else len(layer_names)
-            layer_stride, block_stride, _, _, _ = compute_layout_strides(
-                spec,
-                num_blocks,
-                num_slots,
-                layout,
-                fixed_strides=(None, interleaved_block_stride, None, None, None),
-            )
-            offset = (
-                byte_offset
-                * max(layer_stride, spec.page_size_bytes)
-                // spec.page_size_bytes
-            )
-            if agg > 1:
-                for slot, slot_layers in enumerate(
-                    get_tensor_slots(KVCacheGroupSpec(layer_names, spec))
-                ):
-                    kv_cache_tensors.extend(
-                        KVCacheTensor(
-                            size=size,
-                            layers=[layer_name],
-                            layer_stride=layer_stride,
-                            block_stride=block_stride,
-                            offset=offset + slot * layer_stride,
-                        )
-                        for layer_name in slot_layers
-                    )
-            else:
-                kv_cache_tensors.append(
-                    KVCacheTensor(
-                        size=size,
-                        layers=layer_names,
-                        layer_stride=layer_stride,
-                        block_stride=block_stride,
-                        offset=offset,
-                    )
-                )
-            byte_offset += num_slots * spec.page_size_bytes
+    kv_cache_tensors = _layout_kv_cache_tensors(
+        kv_cache_groups, num_blocks, bytes_per_block, layout, size
+    )
 
     return KVCacheConfig(
         num_blocks=num_blocks,
@@ -2393,16 +2579,28 @@ def get_kv_cache_groups(
         ]
         return packed_groups
 
-    # Prefer preserving each layer's cache semantics. If physical pages cannot
-    # be unified, try a supported allocation-only fallback before failing.
-    try:
-        filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
-    except NotImplementedError:
-        fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)
-        if fallback_groups is None:
-            raise
-        return fallback_groups
-    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+    if not hidden_specs and _mamba_pool_eligible(vllm_config, filtered_spec.values()):
+        # The state layers get their own pool, so their pages are not unified
+        # with the attention pages (that unification is what sized every
+        # attention block like a recurrent state); only the attention layers
+        # are unified among themselves.
+        attention_spec = unify_kv_cache_spec_page_size(
+            {k: v for k, v in filtered_spec.items() if not isinstance(v, MambaSpec)}
+        )
+        filtered_spec = {k: attention_spec.get(k, v) for k, v in filtered_spec.items()}
+        groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+    else:
+        # Prefer preserving each layer's cache semantics. If physical pages
+        # cannot be unified, try a supported allocation-only fallback before
+        # failing.
+        try:
+            filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+        except NotImplementedError:
+            fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)
+            if fallback_groups is None:
+                raise
+            return fallback_groups
+        groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 
     # Add hidden-state layers back with page aligned to the common page.
     if hidden_specs:
@@ -2793,6 +2991,24 @@ def get_kv_cache_configs(
         _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
         for worker_spec in kv_cache_specs
     ]
+    # With a separate mamba pool, its fixed size comes off the top and
+    # everything below plans the main pool's groups against what is left.
+    allocated_groups_per_worker = projected_groups_per_worker
+    split_fixed_bytes = [0] * len(projected_groups_per_worker)
+    planning_groups_per_worker = []
+    for i, groups in enumerate(projected_groups_per_worker):
+        split = _split_mamba_pool_groups(vllm_config, groups) if groups else None
+        if split is None:
+            planning_groups_per_worker.append(groups)
+            continue
+        main_groups, mamba_groups = split
+        planning_groups_per_worker.append(main_groups)
+        split_fixed_bytes[i] = _mamba_pool_fixed_bytes(vllm_config, mamba_groups)
+    available_memory = [
+        avail_mem - fixed
+        for avail_mem, fixed in zip(available_memory, split_fixed_bytes)
+    ]
+    projected_groups_per_worker = planning_groups_per_worker
 
     # If `num_gpu_blocks_override` is set, the cache size that will actually
     # be allocated is decoupled from the profiled `available_memory`:
@@ -2839,15 +3055,23 @@ def get_kv_cache_configs(
         )
 
     kv_cache_configs: list[KVCacheConfig] = []
-    for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
-        projected_groups_per_worker, kv_cache_specs, available_memory
+    for (
+        projected_groups,
+        kv_cache_spec_one_worker,
+        available_memory_one_worker,
+        fixed,
+    ) in zip(
+        allocated_groups_per_worker,
+        kv_cache_specs,
+        available_memory,
+        split_fixed_bytes,
     ):
         assert sum(len(group.layer_names) for group in projected_groups) == len(
             kv_cache_spec_one_worker
         ), "Some layers are not assigned to any group."
         kv_cache_configs.append(
             get_kv_cache_config_from_groups(
-                vllm_config, projected_groups, available_memory_one_worker
+                vllm_config, projected_groups, available_memory_one_worker + fixed
             )
         )
 
@@ -2864,7 +3088,10 @@ def get_kv_cache_configs(
         # strides and offsets stay consistent with the shrunken allocation.
         groups = kv_cache_config.kv_cache_groups
         kv_cache_configs[i] = get_kv_cache_config_from_groups(
-            vllm_config, groups, min_num_blocks * _pool_bytes_per_block(groups)
+            vllm_config,
+            groups,
+            min_num_blocks * _pool_bytes_per_block(planning_groups_per_worker[i])
+            + split_fixed_bytes[i],
         )
 
     for kv_cache_config in kv_cache_configs:
