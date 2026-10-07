@@ -147,6 +147,66 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
+def _call_backend_hook(backend_cls, hook: str, backends: list[type], *args):
+    """Invoke one attention-backend lifecycle hook, aborting on failure.
+
+    The engine never swallows a backend lifecycle hook. These hooks carry
+    the backend's own pre-flight validation and its one-time weight
+    transforms, so a run that skipped one serves a model the backend
+    never finished preparing. A backend that tolerates its own hook
+    failing catches that inside the hook, where it knows what is safe.
+
+    Dispatch is fail-fast and ordered: the first backend to raise aborts
+    before any later backend is dispatched, so a half-applied transform
+    cannot mask the original error. The raised error names the failing
+    backend and the dispatch order.
+    """
+    try:
+        return getattr(backend_cls, hook)(*args)
+    except Exception as e:
+        order = ", ".join(b.__qualname__ for b in backends)
+        raise RuntimeError(
+            f"Attention backend {backend_cls.__module__}."
+            f"{backend_cls.__qualname__} raised in its {hook} lifecycle "
+            f"hook; aborting instead of serving a model that skipped it. "
+            f"Dispatch order was [{order}]; backends after "
+            f"{backend_cls.__qualname__} were not dispatched."
+        ) from e
+
+
+def _backends_in_use(worker) -> list[type]:
+    """Attention backend classes the engine ACTUALLY resolved, de-duplicated.
+
+    ``AttentionBackend.resolve_user_selected_backend`` reads
+    ``vllm_config.attention_config.backend``, which only ``--attention-backend``
+    populates. A backend chosen by auto-derivation (e.g. tkv via
+    ``--kv-cache-dtype tkv``) resolves to ``None``, so every lifecycle hook
+    below was skipped for it — silently, since nothing raised and the guarding
+    ``if`` simply did not take.
+
+    Skipping this hook defers a backend's autotune into the first live
+    request instead of the pre-capture warm-up window, which can exceed
+    a client's request timeout.
+
+    ``model_runner.attn_groups[*].backend`` is the class in use regardless of
+    how it was selected. Falls back to the user-selected enum when no groups
+    exist yet (this is also called before KV-cache init).
+    """
+    seen: list[type] = []
+    for groups in getattr(worker.model_runner, "attn_groups", []) or []:
+        for g in groups:
+            cls = getattr(g, "backend", None)
+            if cls is not None and cls not in seen:
+                seen.append(cls)
+    if not seen:
+        from vllm.v1.attention.backend import AttentionBackend
+
+        sel = AttentionBackend.resolve_user_selected_backend(worker.vllm_config)
+        if sel is not None:
+            seen.append(sel)
+    return seen
+
+
 class AsyncIntermediateTensors(IntermediateTensors):
     """IntermediateTensors with lazy comm synchronization"""
 
@@ -560,6 +620,33 @@ class Worker(WorkerBase):
         # valid when requests arrive.
         set_torch_threads_for_runtime()
 
+        # Backend lifecycle hook: lets the user-selected attention backend
+        # apply one-time weight transforms (e.g. fold a per-layer matrix
+        # into a downstream Linear) once the model is fully loaded.
+        _backends = _backends_in_use(self)
+        for _backend_cls in _backends:
+            _call_backend_hook(
+                _backend_cls,
+                "on_model_loaded",
+                _backends,
+                self,
+                self.model_runner.model,
+            )
+            # Model-based drafters (MTP/Eagle/draft-model) are a separate
+            # nn.Module; backends folding weights per-layer must see its
+            # tree too (ngram-style proposers have no .model — skip).
+            _draft_model = getattr(
+                getattr(self.model_runner, "drafter", None), "model", None
+            )
+            if _draft_model is not None:
+                _call_backend_hook(
+                    _backend_cls,
+                    "on_draft_model_loaded",
+                    _backends,
+                    self,
+                    _draft_model,
+                )
+
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
 
@@ -733,6 +820,19 @@ class Worker(WorkerBase):
                     suggested_util,
                 )
 
+        _budget_backends = _backends_in_use(self)
+        for _backend_cls in _budget_backends:
+            _adjusted = _call_backend_hook(
+                _backend_cls,
+                "adjust_kv_budget",
+                _budget_backends,
+                int(self.available_kv_cache_memory_bytes),
+                self.vllm_config,
+            )
+            if _adjusted is not None and _adjusted > 0:
+                self.available_kv_cache_memory_bytes = _adjusted
+                break
+
         return reserve_mm_ipc_gpu_memory(
             int(self.available_kv_cache_memory_bytes),
             self.model_config.multimodal_config,
@@ -827,6 +927,18 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        # Backend lifecycle hook: KV cache is allocated (initialize_kv_cache
+        # ran in initialize_from_config) but CUDA-graph capture has NOT
+        # started yet — the eager, pre-capture window a compressed-KV
+        # backend needs to warm any per-(k_bw,v_bw) decode autotune so a
+        # smart-mix bundle doesn't re-sweep lazily during capture. No-op
+        # for backends that don't define the hook.
+        _backends = _backends_in_use(self)
+        for _backend_cls in _backends:
+            _call_backend_hook(
+                _backend_cls, "on_kv_cache_initialized", _backends, self
+            )
+
         warmup_sizes: list[int] = []
 
         if (

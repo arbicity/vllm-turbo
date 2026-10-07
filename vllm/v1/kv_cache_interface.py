@@ -213,6 +213,24 @@ class KVCacheSpec:
     def block_table_token_alignment(self) -> int | None:
         return 128
 
+    @property
+    def aggregated_layer_count(self) -> int:
+        """How many model layers one page of this spec already covers.
+
+        Default 1: a page holds one layer's tokens, so a group of N layers
+        needs N pages per block.
+
+        A spec may instead FUSE several layers into one shared page: the
+        layers occupy disjoint byte ranges of the same page, and
+        ``page_size_bytes`` is the SUM of their per-layer pages (the tkv
+        composite spec for per-layer KV bit widths). Such a spec returns the
+        number of layers fused, and its group of N layers then needs
+        N / aggregated_layer_count pages per block, every fused layer viewing
+        the same bytes. Charging the summed page once per layer would cut the
+        usable KV capacity by this factor.
+        """
+        return 1
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         """The maximum possible memory usage of this KV cache in bytes.
 

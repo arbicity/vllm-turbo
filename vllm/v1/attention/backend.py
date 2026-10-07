@@ -109,6 +109,117 @@ class AttentionBackend(ABC):
     def supports_dtype(cls, dtype: torch.dtype) -> bool:
         return dtype in cls.supported_dtypes
 
+    # ── Lifecycle hooks ───────────────────────────────────────────────────
+    # Optional classmethods with no-op defaults. The worker dispatches them
+    # to every attention backend in use (gpu_worker._backends_in_use), falling
+    # back to the user-selected backend before the attention groups exist.
+    #
+    # Note: scheduler/compilation defaults (max_num_batched_tokens,
+    # cudagraph_mode, max_num_seqs, etc.) are deliberately NOT a backend
+    # hook. Those are user-facing config — backends document recommended
+    # values in their README and users set them via CLI flags. Silently
+    # mutating user config from a backend hook is the wrong abstraction.
+
+    @classmethod
+    def adjust_kv_budget(
+        cls,
+        profiled_bytes: int,
+        vllm_config,
+    ) -> int | None:
+        """Optionally adjust the profiler-derived KV budget. Called from
+        Worker.determine_available_memory just before returning.
+
+        Return a new bytes value, or None to accept the profiled budget.
+        Use case: compressed-KV backend on a hybrid model where the
+        profiler over-counts non-KV memory and underestimates the
+        available KV budget.
+        """
+        return None
+
+    @classmethod  # noqa: B027
+    def on_model_loaded(cls, worker, model) -> None:
+        """Called once per worker after Worker.load_model finishes.
+        Receives the worker and the loaded model module.
+
+        Use case: compressed-KV backend that wants to apply a one-time
+        weight transformation (e.g. fold a per-layer matrix into the
+        downstream Linear weight) without the worker holding a model
+        reference for the backend to capture.
+        """
+        pass
+
+    @classmethod  # noqa: B027
+    def on_draft_model_loaded(cls, worker, draft_model) -> None:
+        """Called once per worker after Worker.load_model finishes, right
+        after on_model_loaded, when a model-based speculative-decode
+        drafter is configured. Receives the worker and the loaded DRAFT
+        model module (a separate nn.Module from the target model).
+
+        Use case: a backend applying per-layer weight transforms must
+        resolve draft-tower attention layers (e.g. ``mtp.layers.*``)
+        against the drafter's own module tree — they do not exist in the
+        target model passed to on_model_loaded.
+        """
+        pass
+
+    @classmethod  # noqa: B027
+    def on_kv_cache_initialized(cls, worker) -> None:
+        """Called once per worker after KV cache allocation, before
+        CUDA-graph capture starts. Receives the worker.
+
+        Use case: compressed-KV backend that needs to warm any
+        per-config decode autotune during the eager, pre-capture window
+        instead of lazily during the first live request or during
+        capture — skipping this hook defers that work into the first
+        live request, which can exceed a client's request timeout.
+        """
+        pass
+
+    @classmethod
+    def wraps_mla_backend(cls, base_mla_backend_cls):
+        """If this backend can wrap a stock MLA backend (e.g. compress
+        its shared-KV slot), return the wrapper class. Default: None
+        (don't wrap; standard MLA backend selection applies).
+
+        Consulted by the selector when:
+          - user passed --attention-backend selecting THIS backend
+          - the layer being constructed has use_mla=True
+
+        When this returns non-None for THIS backend class:
+          1. The selector falls through to standard MLA candidate
+             selection (ignoring the user's --attention-backend choice
+             for the MLA layer, since CUSTOM=this isn't an MLA backend).
+          2. The dtype gate is effectively lifted for that selection
+             (kv_cache_dtype is treated as "auto") — the wrapper
+             class is responsible for declaring the real supported
+             dtypes via its supported_kv_cache_dtypes.
+          3. The picked MLA backend is then passed to wraps_mla_backend
+             and the returned wrapper is used.
+
+        Use case: a compressed-KV backend (TKV) that wraps any of
+        TritonMLABackend / FlashAttnMLABackend / etc. with a
+        TkvMLA wrapper.
+        """
+        return None
+
+    @staticmethod
+    def resolve_user_selected_backend(vllm_config) -> "type[AttentionBackend] | None":
+        """Resolve the user-selected attention backend class from
+        vllm_config.attention_config.backend (set by --attention-backend).
+
+        Returns None if no backend is selected or resolution fails.
+        Call sites firing the lifecycle/config hooks above use this to
+        find the right backend class to dispatch on.
+        """
+        attn_cfg = getattr(vllm_config, "attention_config", None)
+        backend_enum = getattr(attn_cfg, "backend", None) if attn_cfg else None
+        if backend_enum is None:
+            return None
+        try:
+            return backend_enum.get_class()
+        except (ValueError, ImportError):
+            return None
+
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: "CacheDType | None") -> bool:
         if kv_cache_dtype is None:

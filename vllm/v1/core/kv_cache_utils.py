@@ -1603,6 +1603,26 @@ def _get_per_layer_spec(
     return spec
 
 
+def get_tensor_slots(group: KVCacheGroupSpec) -> list[list[str]]:
+    """Split a group's layers into the page slots they occupy in a block.
+
+    Normally one slot per layer. When the group's spec fuses layers into one
+    shared page (``aggregated_layer_count`` > 1: the page already SUMS those
+    layers' per-layer pages, which occupy disjoint byte ranges of it), each
+    slot is shared by that many consecutive layers. Layers in a group share
+    one block table, so a shared page keeps every layer's bytes disjoint.
+    """
+    names = group.layer_names
+    agg = group.kv_cache_spec.aggregated_layer_count
+    if agg <= 1:
+        return [[name] for name in names]
+    assert len(names) % agg == 0, (
+        f"group of {len(names)} layers is not divisible by its spec's "
+        f"aggregated_layer_count={agg}; the fused page would not tile the group"
+    )
+    return [names[i : i + agg] for i in range(0, len(names), agg)]
+
+
 def _get_kv_cache_bytes_per_block(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
@@ -1613,8 +1633,8 @@ def _get_kv_cache_bytes_per_block(
 
     bytes_per_block = max(
         sum(
-            _get_per_layer_spec(group, layer_name).page_size_bytes
-            for layer_name in group.layer_names
+            _get_per_layer_spec(group, layer_names[0]).page_size_bytes
+            for layer_names in get_tensor_slots(group)
         )
         for group in kv_cache_groups
     )
@@ -1795,10 +1815,14 @@ def get_kv_cache_config_from_groups(
 
         byte_offset = 0
         for spec, layer_names in layers_by_spec.items():
+            agg = spec.aggregated_layer_count
+            # Layers fused into one shared page take one page slot per fused
+            # set (see get_tensor_slots); every layer of a set views it.
+            num_slots = len(layer_names) // agg if agg > 1 else len(layer_names)
             layer_stride, block_stride, _, _, _ = compute_layout_strides(
                 spec,
                 num_blocks,
-                len(layer_names),
+                num_slots,
                 layout,
                 fixed_strides=(None, interleaved_block_stride, None, None, None),
             )
@@ -1807,16 +1831,31 @@ def get_kv_cache_config_from_groups(
                 * max(layer_stride, spec.page_size_bytes)
                 // spec.page_size_bytes
             )
-            kv_cache_tensors.append(
-                KVCacheTensor(
-                    size=size,
-                    layers=layer_names,
-                    layer_stride=layer_stride,
-                    block_stride=block_stride,
-                    offset=offset,
+            if agg > 1:
+                for slot, slot_layers in enumerate(
+                    get_tensor_slots(KVCacheGroupSpec(layer_names, spec))
+                ):
+                    kv_cache_tensors.extend(
+                        KVCacheTensor(
+                            size=size,
+                            layers=[layer_name],
+                            layer_stride=layer_stride,
+                            block_stride=block_stride,
+                            offset=offset + slot * layer_stride,
+                        )
+                        for layer_name in slot_layers
+                    )
+            else:
+                kv_cache_tensors.append(
+                    KVCacheTensor(
+                        size=size,
+                        layers=layer_names,
+                        layer_stride=layer_stride,
+                        block_stride=block_stride,
+                        offset=offset,
+                    )
                 )
-            )
-            byte_offset += len(layer_names) * spec.page_size_bytes
+            byte_offset += num_slots * spec.page_size_bytes
 
     return KVCacheConfig(
         num_blocks=num_blocks,
