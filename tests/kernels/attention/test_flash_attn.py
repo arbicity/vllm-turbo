@@ -217,46 +217,39 @@ def test_varlen_with_paged_kv(
     )
 
 
-@pytest.mark.parametrize("num_splits", [2, 5, 16])
-@pytest.mark.parametrize(
-    "seq_lens",
-    [
-        [(6, 16384)],
-        [(6, 8192), (6, 8191), (6, 4097)],
-        [(1, 4096), (6, 4096), (37, 4096)],
-        [(4, 129), (1, 8000), (12, 33)],
-    ],
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(100),
+    reason="FA4 only has a dedicated head_size=256 kernel on Blackwell",
 )
-@pytest.mark.parametrize("num_heads", [(12, 2), (4, 4)])
-@pytest.mark.parametrize("head_size", [128, 256])
-@pytest.mark.parametrize("sliding_window", [None, 256])
+@pytest.mark.parametrize(
+    "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
+)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("sliding_window", SLIDING_WINDOWS)
 @torch.inference_mode()
-def test_fa2_varlen_paged_kv_split_kv(
-    num_splits: int,
+def test_fa4_hd256_paged_call_shape(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
-    head_size: int,
     sliding_window: int | None,
 ) -> None:
-    """Split-K must not change varlen paged-KV output or LSE at `max_seqlen_q > 1`.
+    """Handles excess block-table columns with page-aligned ``max_seqlen_k``."""
+    from vllm.v1.attention.backends.fa_utils import FA4_HD256_PAGE_SIZE
 
-    The combine kernel addresses O and LSE through `cu_seqlens_q`, so this also
-    covers non-uniform query lengths, where the padded scratch layout and the
-    unpadded output layout diverge.
-    """
-    if not is_fa_version_supported(2):
-        pytest.skip(f'FA2 unsupported: "{fa_version_unsupported_reason(2)}"')
+    if not is_fa_version_supported(4):
+        pytest.skip(f'FA4 unsupported: "{fa_version_unsupported_reason(4)}"')
     torch.set_default_device("cuda")
     set_random_seed(0)
 
-    dtype = torch.bfloat16
-    block_size = 16
+    head_size = 256
+    block_size = FA4_HD256_PAGE_SIZE
     num_blocks = 2048
-    query_lens = [x[0] for x in seq_lens]
-    kv_lens_list = [x[1] for x in seq_lens]
+    dtype = torch.bfloat16
     num_query_heads, num_kv_heads = num_heads
-    scale = head_size**-0.5
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    max_kv_len = max(kv_lens)
     window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+    scale = head_size**-0.5
 
     query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
     key_cache = torch.randn(
@@ -266,47 +259,34 @@ def test_fa2_varlen_paged_kv_split_kv(
     cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
         dim=0, dtype=torch.int32
     )
-    kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32)
-    max_num_blocks_per_seq = (max(kv_lens_list) + block_size - 1) // block_size
+    num_pages = (max_kv_len + block_size - 1) // block_size
     block_tables = torch.randint(
-        0, num_blocks, (len(seq_lens), max_num_blocks_per_seq), dtype=torch.int32
+        0, num_blocks, (len(seq_lens), num_pages + 3), dtype=torch.int32
     )
 
-    def run(splits: int):
-        return flash_attn_varlen_func(
-            q=query,
-            k=key_cache,
-            v=value_cache,
-            cu_seqlens_q=cu_query_lens,
-            seqused_k=kv_lens,
-            max_seqlen_q=max(query_lens),
-            max_seqlen_k=max(kv_lens_list),
-            softmax_scale=scale,
-            causal=True,
-            window_size=window_size,
-            block_table=block_tables,
-            num_splits=splits,
-            return_softmax_lse=True,
-            fa_version=2,
-        )
-
-    out_ref, lse_ref = run(1)
-    out_split, lse_split = run(num_splits)
-
-    # Split-K reorders the softmax reduction, so agreement is bounded by the
-    # bf16 output step (2^-8), not by the fp32 accumulation.
-    torch.testing.assert_close(out_split, out_ref, atol=1e-2, rtol=1e-2)
-    finite = torch.isfinite(lse_ref)
-    torch.testing.assert_close(lse_split[finite], lse_ref[finite], atol=5e-3, rtol=5e-3)
-
+    output = flash_attn_varlen_func(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=torch.tensor(kv_lens, dtype=torch.int32),
+        max_seqlen_q=max(query_lens),
+        max_seqlen_k=num_pages * block_size,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables[:, :num_pages],
+        num_splits=1,
+        fa_version=4,
+    )
     ref_output = ref_paged_attn(
         query=query,
         key_cache=key_cache,
         value_cache=value_cache,
         query_lens=query_lens,
-        kv_lens=kv_lens_list,
+        kv_lens=kv_lens,
         block_tables=block_tables,
         scale=scale,
         sliding_window=sliding_window,
     )
-    torch.testing.assert_close(out_split, ref_output, atol=1.5e-2, rtol=1e-2)
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)

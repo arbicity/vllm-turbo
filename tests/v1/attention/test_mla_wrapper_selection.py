@@ -18,9 +18,7 @@ from vllm.v1.attention.selector import _mla_wrapper_cls, _mla_wrapper_for_dtype
 class WrapperBackend(AttentionBackend):
     """Stands in for a plugin backend that wraps an MLA backend."""
 
-    @classmethod
-    def get_supported_kv_cache_dtypes(cls):
-        return ["plugin_kv"]
+    supported_kv_cache_dtypes = ["plugin_kv"]
 
     @classmethod
     def wraps_mla_backend(cls, base_mla_backend_cls):
@@ -30,9 +28,7 @@ class WrapperBackend(AttentionBackend):
 class PlainBackend(AttentionBackend):
     """A plugin backend that does not wrap MLA."""
 
-    @classmethod
-    def get_supported_kv_cache_dtypes(cls):
-        return ["plugin_kv"]
+    supported_kv_cache_dtypes = ["plugin_kv"]
 
 
 @pytest.fixture

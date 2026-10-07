@@ -1,245 +1,122 @@
 # KV Backend Capability Protocol
 
-This fork adds a small set of method overrides to `AttentionBackend` so
-plugin-supplied attention backends can declare their KV layout,
-lifecycle, and MLA-wrapping needs through the backend object itself —
-instead of monkey-patching downstream vLLM code.
+This fork carries the small seam an out-of-tree, compressed-KV attention
+backend needs on top of upstream vLLM. Everything a backend can express
+through upstream's own extension points lives in the plugin; this fork adds
+only what upstream has no hook for.
 
-The protocol is **strictly additive** and **default-preserving**: every new
-method has a default that reproduces upstream behavior. Existing
-backends (FlashAttention, Triton, ROCm, CPU, ...) are unchanged. The
-protocol only takes effect when a plugin-registered CUSTOM backend opts in.
+The seam is **strictly additive** and **default-preserving**: every hook has
+a default that reproduces upstream behaviour, and nothing activates unless a
+plugin registers a backend or a KV-cache dtype. The reference consumer is the
+Turbo Attention plugin (`tkv`, `--kv-cache-dtype tkv`); the seam itself holds
+no TKV-specific knowledge beyond the `TURBO_ATTN` enum slot and the
+`_tq_layer_idx` injection.
 
-This document is the architectural reference for upstream review. The
-reference consumer of these hooks is the TurboQuant KV-cache plugin
-(`tkv`); the protocol contains no TurboQuant-specific knowledge.
-
----
-
-## Why a protocol
-
-Plugin attention backends today must do most of their work by **monkey-
-patching** vLLM internals from a `register_*` entry point. The TurboQuant
-plugin grew to **15 separate runtime patches** spanning `KVCacheSpec`
-dispatch, page sizing, the MLA selector, profiler accounting, the KV-cache
-manager lifecycle, and the o-projection fold.
-
-The patches all answered variants of the same question: *"the backend
-knows X about its own KV layout / lifecycle / MLA needs — how do I get X
-into the upstream code path that needs to consult it?"*
-
-The fix is to let the backend **declare** X on itself, and have the
-upstream code path **consult the backend object** at the point where it
-already lives. That single discipline collapses every patch.
+Base: upstream **v0.31.0**.
 
 ---
 
-## General approach
+## What upstream already provides (and the plugin uses directly)
 
-For each capability that a non-stock backend needs to influence:
+| Need | Upstream extension point |
+|---|---|
+| Register the backend class | `register_backend(AttentionBackendEnum.TURBO_ATTN, ...)` |
+| Load the plugin in every process | `vllm.general_plugins` entry point |
+| Pack the KV page (one head slot of the codec's slot bytes) | `AttentionBackend.customize_spec`, applied by both model runners to every layer's spec and by the hybrid block-size alignment |
+| Page geometry the allocator reads | `AttentionSpec.num_heads` / `state_content_size_bytes` (`[B, H, N, C]` views, vllm#51718) |
+| KV layout the kernels consume | `AttentionBackend.supported_kv_cache_layouts` |
+| Single-type manager for a custom spec | `KVCacheSpecRegistry` (MRO lookup: a `FullAttentionSpec` subclass gets the full-attention manager) |
 
-1. **Add an override** on `AttentionBackend` (classmethod or static, never
-   stateful). Default returns `None` / preserves current behavior.
-2. **Replace the upstream hardcoded branch** with: *if the backend's
-   override is non-default, use it; otherwise fall through to the existing
-   path.* No upstream behavior change in the default case.
-3. **No new types in the public surface.** All overrides return existing
-   vLLM types (`KVCacheSpec`, `SingleTypeKVCacheManager`, callables, ...)
-   or simple primitives.
+## The hooks this fork adds
 
-This is the same shape as vLLM's existing platform-detect / scheduler-
-hook / CustomOp registries — small, opt-in, additive.
+### Plugin KV-cache dtypes — `vllm/config/cache.py`
 
----
+`register_cache_dtype(name, torch_dtype)`, `validate_cache_dtype`,
+`cache_dtype_choices`, `is_plugin_cache_dtype`. `CacheConfig.cache_dtype` is
+typed `str` and gated by the runtime validator: pydantic compiles a `Literal`
+annotation into the class validator at class-creation time, before any plugin
+has registered, so a `Literal` field makes every plugin dtype
+unconstructible. `CacheDType` survives as the static alias for the builtins.
 
-## The hooks
+Consumers: `--kv-cache-dtype` choices/type (`engine/arg_utils.py`) and the
+dtype assertion in `get_attn_backend` (`v1/attention/selector.py`).
 
-The 7 protocol hooks are organized into three layers. Default behavior
-(when the backend doesn't override) is identical to current upstream.
+### The `TURBO_ATTN` backend slot
 
-### Layer 1 — KV layout
+- `AttentionBackendEnum.TURBO_ATTN = None` (`v1/attention/backends/registry.py`),
+  filled by the plugin's `register_backend`; `CUSTOM` stays free.
+- `--attention-backend turbo-attn` parses (`config/attention.py` maps `-` to `_`).
+- A plugin-registered `--kv-cache-dtype` with no `--attention-backend`
+  auto-selects `TURBO_ATTN` (`engine/arg_utils.py`), because the worker's
+  load-time hooks dispatch before the attention groups exist.
+- `TURBO_ATTN` is a CUDA candidate once registered (`platforms/cuda.py`), so
+  auto-selection paths that do not go through `EngineArgs` (e.g. a draft
+  model's own selection) find it; it self-rejects every other dtype.
 
-These describe how the backend wants its KV pages laid out and managed.
+### Lifecycle hooks — `vllm/v1/attention/backend.py`, `vllm/v1/worker/gpu_worker.py`
 
-#### `get_supported_kv_cache_dtypes() -> Iterable[str] | None`
+Classmethods with no-op defaults. The worker dispatches each to every
+backend in use (`_backends_in_use`: the attention groups' backends, falling
+back to the user-selected one before the groups exist), in order, and aborts
+on the first that raises (`_call_backend_hook`).
 
-Classmethod. Lets a backend declare which `--kv-cache-dtype` values it
-accepts (e.g. a compressed backend declares `"tkv"`). Default `None`
-means "accept whatever upstream already accepts."
+| Hook | Called from | Used for |
+|---|---|---|
+| `on_model_loaded(worker, model)` | `Worker.load_model` | pre-flight checks, one-time o_proj fold, memory booking before profiling |
+| `on_draft_model_loaded(worker, draft_model)` | `Worker.load_model`, when a model-based drafter exists | fold the drafter's own layers |
+| `adjust_kv_budget(profiled_bytes, vllm_config)` | `Worker.determine_available_memory` | replace a non-positive profiled budget |
+| `on_kv_cache_initialized(worker)` | `Worker.compile_or_warm_up_model`, before capture | bind composite regions, prefill prewarm, decode autotune |
 
-Consumed by the dtype validator in `Attention.__init__`, immediately
-after `--kv-cache-dtype` has been parsed.
+`AttentionBackend.resolve_user_selected_backend(vllm_config)` resolves the
+fallback backend class.
 
-#### `get_kv_cache_spec_class(spec_kind: SpecKind) -> type[KVCacheSpec] | None`
+### MLA wrapping — `vllm/v1/attention/selector.py`
 
-Lets a backend swap in a custom `KVCacheSpec` subclass for a given spec
-kind (`"full_attention"`, `"sliding_window"`, `"mla"`, `"chunked_local"`,
-...). Default `None` means "use the upstream spec class for that kind."
+`AttentionBackend.wraps_mla_backend(base_mla_backend_cls)`. When the selected
+(or, with no `--attention-backend`, the dtype-claiming plugin) backend
+overrides it on an MLA model, the selector picks the MLA candidate with the
+dtype gate lifted and returns the wrapper the hook builds around it. The
+wrapper declares the plugin dtypes in its `supported_kv_cache_dtypes` and
+packs its page through `customize_spec`.
 
-Consumed by `Attention.get_kv_cache_spec` and `MLAAttention.get_kv_cache_spec`,
-which previously hardcoded the upstream spec classes. Removes 3 of the 15
-prior monkey patches.
+### MLA chunked-context gather — `vllm/model_executor/layers/attention/mla_attention.py`
 
-#### `KVCacheSpec.get_manager_class() -> type[SingleTypeKVCacheManager] | None`
+`MLACommonBaseImpl._get_gather_op()` returns the op the chunked-context
+**prefill** uses to gather (and dequantize) cached latents; the default is
+`ops.gather_and_maybe_dequant_cache` itself. A wrapper impl returns its own
+op with the same signature to read a packed format.
 
-Method on `KVCacheSpec` (defined in `vllm/v1/kv_cache_interface.py`). Lets
-a custom spec choose its own single-type manager. Default `None` falls
-through to the existing dispatch table in
-`vllm/v1/core/single_type_kv_cache_manager.py:get_manager_for_kv_cache_spec`.
+### Per-layer index — `vllm/model_executor/layers/attention/attention.py`
 
-Allows compressed-page-aware managers (e.g. one that knows compressed
-pages are a different size than uncompressed) without editing the
-dispatch table.
+For `kv_cache_dtype == "tkv"`, `Attention.__init__` passes the layer ordinal
+from the prefix as `_tq_layer_idx` so the impl resolves its per-layer bit
+widths before the slot layout is frozen.
 
-#### `_get_gather_op() -> Callable | None`
+### Fused pages — `vllm/v1/kv_cache_interface.py`, `vllm/v1/core/kv_cache_utils.py`
 
-Method on the per-step `MLACommonImpl`. Lets a backend wrapping MLA
-substitute its own gather operation (used by MLA's decode path to pull
-KV pages). Default `None` means "use the stock `kv_cache.gather()`."
-
-This is the only hook whose owner is the per-step impl, not the backend
-class — it's parameterized by the live request batch, so the backend
-class can't know it ahead of time. Backends that wrap MLA implement it
-via a small shim returned from a backend-class factory.
-
-### Layer 2 — Lifecycle
-
-These let a backend hook into worker-level events. They're called
-unconditionally by the worker; the default body is empty so non-opt-in
-backends are unaffected.
-
-#### `on_model_loaded(worker, model) -> None`
-
-Classmethod. Called from `gpu_worker.load_model` after the model is on
-device, before profiling. Lets the backend run one-time post-load
-mutations against the materialized model — e.g. a compressed-KV plugin
-that needs to fold a residual rotation into the output projection
-weights.
-
-The classmethod signature receives the worker so the backend can stash
-state (model ref, config) for later hooks.
-
-#### `adjust_kv_budget(profiled_bytes: int, vllm_config) -> int | None`
-
-Classmethod. Called from `gpu_worker.determine_available_memory` after
-the profiler reports its KV budget. The backend may return a
-substituted budget or `None` to accept the profiler's number. Used by
-backends whose memory accounting genuinely diverges from the profiler's
-heuristic — e.g. some Mamba/GDN paths over-count non-KV memory and
-report ≤0 bytes; the backend can fall back to actual free memory.
-
-Default `None` is identity. **Critically additive**: a backend that
-doesn't override this gets exactly today's profiler-driven budget.
-
-#### `on_kv_manager_created(mgr) -> None`
-
-Classmethod. Called from `KVCacheManager.__init__` after the per-group
-managers are wired up. Lets a backend register pre-step / pre-allocate
-callbacks on the manager — e.g. a cold-tier plugin draining a write-back
-buffer before the scheduler picks the next batch.
-
-### Layer 3 — MLA wrapping
-
-This is the hook that lets a plugin backend **wrap** MLA, instead of
-**replacing** it.
-
-#### `wraps_mla_backend(base_mla_backend_cls) -> type[AttentionBackend] | None`
-
-Classmethod. Called from `_cached_get_attn_backend` when the user
-selected a CUSTOM backend on a model that vLLM would otherwise dispatch
-to MLA. The CUSTOM backend may return a wrapper subclass that delegates
-to the stock MLA backend with extra steps (e.g. compress / decompress
-on the K/V tensors). Default `None` means "I don't wrap MLA; treat me
-as a standalone backend."
-
-When non-None, the selector resolves the MLA candidate as it normally
-would, with the CUSTOM backend's dtype gate applied, and then calls the
-returned wrapper class — a tiny composition that the plugin owns end
-to end. Removes the two largest prior monkey patches (the MLA-dispatch
-patch and the dtype-extension patch), which together accounted for
-hundreds of LOC.
+`KVCacheSpec.aggregated_layer_count` (default 1). A spec whose
+`page_size_bytes` already sums N layers' per-layer pages (the TKV composite
+spec for per-layer bit widths) returns N; the planner then reserves one page
+per N layers in each block (`get_tensor_slots`) and gives every fused layer a
+view of that same page. Without it the summed page is charged once per layer
+and usable capacity drops N-fold.
 
 ---
 
-## Per-problem mapping (TKV reference consumer)
+## Sync workflow when moving to a new upstream release
 
-The TurboQuant plugin previously needed 15 monkey patches. Each one is
-consumed by exactly one of the 7 hooks above (some hooks subsume
-multiple patches because they generalized the underlying need):
-
-| Old monkey patch                              | New protocol hook                  |
-|-----------------------------------------------|------------------------------------|
-| Add `"tkv"` to allowed cache-dtype list      | `get_supported_kv_cache_dtypes`    |
-| Inject `TKVAttentionSpec` for full-attn      | `get_kv_cache_spec_class("full_attention")` |
-| Inject `TKVAttentionSpec` for sliding-window | `get_kv_cache_spec_class("sliding_window")` |
-| Inject `TQMLAAttentionSpec` for MLA           | `get_kv_cache_spec_class("mla")`   |
-| Page-size override for compressed pages       | `KVCacheSpec.get_manager_class`    |
-| Manager-dispatch override                     | `KVCacheSpec.get_manager_class`    |
-| MLA selector dtype gate                       | `wraps_mla_backend`                |
-| MLA backend dispatch                          | `wraps_mla_backend`                |
-| MLA per-step gather override                  | `MLACommonImpl._get_gather_op`     |
-| Worker post-load o-proj fold                  | `on_model_loaded`                  |
-| Worker post-load model-ref stash              | `on_model_loaded`                  |
-| KV budget profiler fallback                   | `adjust_kv_budget`                 |
-| Cold-drain pre-step callback registration     | `on_kv_manager_created`            |
-| OOM-snapshot diagnostic install               | (out of scope — moved to plugin's `tkv.debug`) |
-| Auto-config defaults                          | (out of scope — users now set flags explicitly) |
-
-The bottom two were moved out of upstream-touching code entirely; the
-top thirteen are dissolved into the seven hooks.
-
----
-
-## Files modified
-
-```
-vllm/_custom_ops.py
-vllm/platforms/interface.py
-vllm/model_executor/layers/attention/attention.py
-vllm/model_executor/layers/attention/mla_attention.py
-vllm/model_executor/layers/rotary_embedding/common.py
-vllm/v1/attention/backend.py
-vllm/v1/attention/selector.py
-vllm/v1/kv_cache_interface.py
-vllm/v1/core/kv_cache_manager.py
-vllm/v1/core/single_type_kv_cache_manager.py
-vllm/v1/worker/gpu_worker.py
-```
-
-`rotary_embedding/common.py` is not part of the protocol itself — it is a
-targeted bug fix on the same branch. The previous code probed for
-`flash_attn` via `find_spec` (which falsely succeeds under FA4, whose
-package only ships `flash_attn.cute` as a namespace), then assumed
-`flash_attn.ops.triton.rotary` exists and crashed. The fix replaces the
-package probe with a small registry of fast-path factories that
-feature-detect by **symbol import**, not by package name. Any future
-fast paths (FA4 cute rotary, fused custom kernel, ...) plug in via
-`register_rotary_fast_path` from anywhere.
-
----
-
-## Sync workflow when rebasing on upstream
-
-1. `git fetch upstream && git rebase upstream/main`.
-2. Conflicts will fall on the touched files in the list above. Most are
-   single-method additions or single-callsite dispatch substitutions —
-   resolve by re-applying the protocol logic on top of upstream's new
-   code.
-3. Run `pytest tests/v1/core/test_kv_drain_hook.py` to confirm the
-   lifecycle hook still fires.
-4. Run a TKV serve smoke (`vllm serve <model> --kv-cache-dtype tkv
-   --attention-backend custom`) — exercises every hook.
-5. Bump the base SHA pin in the consuming Docker overlay to the new
-   upstream tip.
-
----
-
-## Behavior preservation guarantee
-
-The diff is `~321 insertions / ~305 deletions` across 11 files. The
-deletions are mostly within bodies of refactored methods (replacing a
-hardcoded branch with a backend-consultation), not removed call sites.
-Run the existing vLLM test suite — the protocol's default impls
-preserve every pre-existing code path. The protocol only activates
-when a plugin backend overrides a hook and is selected via
-`--attention-backend custom`.
+1. Squash the carry (`git diff <old-tag> origin/main`) into one commit on the
+   old tag and cherry-pick it onto the new tag (a 3-way merge against the
+   real base).
+2. Resolve conflicts with upstream's structure winning; re-apply the hook on
+   top. Check each hunk against the table above: when upstream adds an
+   extension point that covers a hook, move the capability into the plugin
+   and drop the hook.
+3. `pytest tests/v1/core/test_kv_seam_invariants.py
+   tests/v1/core/test_aggregated_layer_count.py
+   tests/v1/attention/test_mla_wrapper_selection.py
+   tests/v1/worker/test_gpu_worker.py -k hook
+   tests/engine/test_arg_utils.py -k plugin_kv_cache_dtype` (CPU).
+4. Bump the engine image base and COPY list in turbo-attn (`docker/Dockerfile`,
+   `docker/PATCHES.md`; `scripts/ci/overlay_drift_guard.sh` checks the list),
+   then let its engine-image pipeline build and GPU-validate the image.

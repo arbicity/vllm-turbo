@@ -38,6 +38,8 @@ class AttentionSelectorConfig(NamedTuple):
     use_kv_connector: bool = False
     use_pcp: bool = False
     use_adaptive_verification: bool = False
+    use_dcp: bool = False
+    use_rswa: bool = False
 
     def __repr__(self):
         return (
@@ -56,7 +58,9 @@ class AttentionSelectorConfig(NamedTuple):
             f"use_batch_invariant={self.use_batch_invariant}, "
             f"use_kv_connector={self.use_kv_connector}, "
             f"use_adaptive_verification={self.use_adaptive_verification}, "
-            f"use_pcp={self.use_pcp})"
+            f"use_pcp={self.use_pcp}, "
+            f"use_dcp={self.use_dcp}, "
+            f"use_rswa={self.use_rswa})"
         )
 
 
@@ -84,6 +88,7 @@ def get_attn_spec_kind(
 
     Returns:
         The ``KVCacheSpecKind`` the layer maps to.
+
     """
     from vllm.v1.kv_cache_interface import KVCacheSpecKind
 
@@ -114,7 +119,6 @@ def get_attn_backend(
     has_sliding_window: bool = False,
 ) -> type[AttentionBackend]:
     """Selects which attention backend to use and lazily imports it."""
-
     if kv_cache_dtype is not None:
         from vllm.config.cache import validate_cache_dtype
         # Raises ValueError with a clear message if the dtype isn't
@@ -167,6 +171,11 @@ def get_attn_backend(
         use_kv_connector=use_kv_connector,
         use_pcp=vllm_config.parallel_config.prefill_context_parallel_size > 1,
         use_adaptive_verification=use_adaptive_verification,
+        use_dcp=vllm_config.parallel_config.decode_context_parallel_size > 1,
+        use_rswa=(
+            vllm_config.model_config is not None
+            and vllm_config.model_config.rswa_window is not None
+        ),
     )
 
     # A per-KV-group override (keyed by KVCacheSpecKind) takes precedence over
@@ -181,10 +190,15 @@ def get_attn_backend(
         )
         backend = attention_config.backend_per_kind.get(kind.value, backend)
 
+    # The KV cache layout is resolved across all of the model's backends at once
+    # in get_kv_cache_spec(); a single selection cannot see its peers.
     return _cached_get_attn_backend(
         backend=backend,
         attn_selector_config=attn_selector_config,
         num_heads=num_heads,
+        _run_kv_cache_dtype=(
+            cache_config.cache_dtype if cache_config is not None else None
+        ),
     )
 
 
@@ -247,7 +261,11 @@ def _cached_get_attn_backend(
     backend,
     attn_selector_config: AttentionSelectorConfig,
     num_heads: int | None = None,
+    *,
+    _run_kv_cache_dtype: CacheDType | None = None,
 ) -> type[AttentionBackend]:
+    # Some platform selectors inspect the run-wide cache dtype. Keep it in the
+    # cache key even though they read the value from the current config.
     from vllm.platforms import current_platform
 
     # MLA wrapping: when the user selected an attention backend that
@@ -275,8 +293,6 @@ def _cached_get_attn_backend(
         # Fall through to standard MLA selection without the user's
         # backend constraint AND with dtype gate lifted (kv_cache_dtype=
         # "auto"). The wrapper class will be applied below.
-        from typing import cast
-
         relaxed_config = attn_selector_config._replace(
             kv_cache_dtype=cast(CacheDType | None, "auto"),
         )
@@ -309,18 +325,6 @@ def _cached_get_attn_backend(
                 getattr(wrapper, "__name__", repr(wrapper)),
             )
             backend = wrapper
-
-    # Adjust kv cache layout if the selected backend requires a specific one
-    required_layout = backend.get_required_kv_cache_layout()
-    if required_layout is not None:
-        from vllm.v1.attention.backends.utils import set_kv_cache_layout
-
-        set_kv_cache_layout(required_layout)
-        logger.info_once(
-            "Using %s KV cache layout for %s backend.",
-            required_layout,
-            backend.get_name(),
-        )
 
     return backend
 

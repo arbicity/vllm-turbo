@@ -2,13 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from collections.abc import Callable
-from typing import Any
+from contextlib import suppress
+from importlib import import_module
 
 import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
@@ -69,10 +70,10 @@ def yarn_linear_ramp_mask(
     return ramp_func
 
 
-def yarn_get_mscale(scale: float = 1) -> float:
+def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
-    return 0.1 * math.log(scale) + 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
 
 
 def _flashinfer_rotary_embedding(
@@ -99,70 +100,12 @@ def _flashinfer_rotary_embedding(
     )
 
 
-def _flashinfer_rotary_embedding_fake(
-    positions: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    head_size: int,
-    cos_sin_cache: torch.Tensor,
-    is_neox: bool,
-) -> None:
-    return
-
-
 # Register flashinfer rotary embedding custom op
 direct_register_custom_op(
     op_name="flashinfer_rotary_embedding",
     op_func=_flashinfer_rotary_embedding,
     mutates_args=["query", "key"],  # These tensors are modified in-place
-    fake_impl=_flashinfer_rotary_embedding_fake,
 )
-
-
-# Registry of optional fast-path implementations for ApplyRotaryEmb.
-# Each entry is (name, factory). The factory returns a callable matching
-# flash_attn.ops.triton.rotary.apply_rotary's signature, or raises
-# ImportError if its dependency is unavailable. The first factory that
-# returns successfully wins.
-#
-# This replaces feature-detect-by-package-name (find_spec) with
-# feature-detect-by-symbol-import. find_spec("flash_attn") was falsely
-# truthy under flash-attn 4 (which only ships flash_attn.cute as a
-# namespace package), which then raised ModuleNotFoundError on every
-# model construction when the subsequent .ops.triton.rotary import ran.
-_ROTARY_FAST_PATHS: list[tuple[str, Callable[[], Callable[..., Any]]]] = []
-
-
-def register_rotary_fast_path(
-    name: str,
-    factory: Callable[[], Callable[..., Any]],
-) -> None:
-    """Register a candidate fast-path implementation for ApplyRotaryEmb.
-
-    Implementations are tried in registration order; the first whose
-    factory returns successfully (i.e. its dependency imports cleanly)
-    is used. The returned callable must accept the same arguments as
-    flash_attn.ops.triton.rotary.apply_rotary.
-    """
-    _ROTARY_FAST_PATHS.append((name, factory))
-
-
-def _select_rotary_fast_path() -> tuple[str | None, Callable[..., Any] | None]:
-    for name, factory in _ROTARY_FAST_PATHS:
-        try:
-            return name, factory()
-        except ImportError:
-            continue
-    return None, None
-
-
-def _flash_attn_rotary_factory() -> Callable[..., Any]:
-    from flash_attn.ops.triton.rotary import apply_rotary
-    return apply_rotary
-
-
-# Built-in fast paths shipped with vLLM.
-register_rotary_fast_path("flash_attn", _flash_attn_rotary_factory)
 
 
 # --8<-- [start:apply_rotary_emb]
@@ -180,9 +123,12 @@ class ApplyRotaryEmb(CustomOp):
         self.is_neox_style = is_neox_style
         self.enable_fp32_compute = enable_fp32_compute
 
-        self._rotary_fast_path_name, self.apply_rotary_emb_fast = (
-            _select_rotary_fast_path()
-        )
+        self.apply_rotary_emb_flash_attn = None
+        if not current_platform.is_cpu():
+            with suppress(ModuleNotFoundError):
+                self.apply_rotary_emb_flash_attn = import_module(
+                    "flash_attn.ops.triton.rotary"
+                ).apply_rotary
 
     @staticmethod
     def forward_static(
@@ -192,14 +138,14 @@ class ApplyRotaryEmb(CustomOp):
         is_neox_style: bool = True,
         enable_fp32_compute: bool = False,
     ) -> torch.Tensor:
-        """
-        Args:
-            x: [batch_size (optional), seq_len, num_heads, head_size]
-            cos: [seq_len, head_size // 2]
-            sin: [seq_len, head_size // 2]
-            is_neox_style: Whether to use the Neox-style or GPT-J-style.
-            enable_fp32_compute: Temporarily convert x, cos, sin to FP32 dtype
-                                 for higher accuracy.
+        """Args:
+        x: [batch_size (optional), seq_len, num_heads, head_size]
+        cos: [seq_len, head_size // 2]
+        sin: [seq_len, head_size // 2]
+        is_neox_style: Whether to use the Neox-style or GPT-J-style.
+        enable_fp32_compute: Temporarily convert x, cos, sin to FP32 dtype
+                             for higher accuracy.
+
         """
         origin_dtype = x.dtype
         if enable_fp32_compute:
@@ -291,6 +237,18 @@ class ApplyRotaryEmb(CustomOp):
         output = self._post_process(output, origin_shape, origin_dtype)
         return output
 
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        import vllm._xpu_ops  # noqa: F401 registers torch.ops.vllm.xpu_apply_rotary_emb
+
+        x, cos, sin, origin_shape, origin_dtype = self._pre_process(x, cos, sin)
+        output = torch.ops.vllm.xpu_apply_rotary_emb(x, cos, sin, self.is_neox_style)
+        return self._post_process(output, origin_shape, origin_dtype)
+
     def forward_hip(
         self,
         x: torch.Tensor,
@@ -309,7 +267,7 @@ class ApplyRotaryEmb(CustomOp):
         `Triton Error [HIP]: Code: 1, invalid argument`. Fall back to the
         native PyTorch implementation in that case.
         """
-        if self.apply_rotary_emb_fast is not None:
+        if self.apply_rotary_emb_flash_attn is not None:
             x, cos, sin, origin_shape, origin_dtype = self._pre_process(x, cos, sin)
 
             seq_len = x.shape[-3]
@@ -331,7 +289,7 @@ class ApplyRotaryEmb(CustomOp):
                 ...
             """
             interleaved = not self.is_neox_style
-            output = self.apply_rotary_emb_fast(
+            output = self.apply_rotary_emb_flash_attn(
                 x, cos, sin, interleaved=interleaved
             ).type_as(x)
 
