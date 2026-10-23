@@ -417,6 +417,25 @@ class Attention(nn.Module, AttentionLayerBase):
                 extra_impl_args.setdefault("block_n", block_n)
 
         impl_cls = self.attn_backend.get_impl_cls()
+        # Let the TKV backend look up per-layer allocation at init time so
+        # it can set the correct codec bit widths before the slot layout is frozen.
+        if kv_cache_dtype == "tkv" and "_tq_layer_idx" not in extra_impl_args:
+            from vllm.model_executor.models.utils import extract_layer_index
+
+            try:
+                _tq_lidx = extract_layer_index(prefix)
+            except (AssertionError, IndexError, ValueError):
+                # extract_layer_index rejects prefixes that carry no single
+                # layer ordinal. The backend receives no index and decides
+                # for itself: it raises when it needs a per-layer lookup and
+                # uses uniform bit widths when it does not.
+                logger.debug(
+                    "tkv: no layer ordinal in attention prefix %r; the "
+                    "backend resolves its own bit widths.",
+                    prefix,
+                )
+            else:
+                extra_impl_args = {**extra_impl_args, "_tq_layer_idx": _tq_lidx}
         self.impl = impl_cls(  # type: ignore[assignment]  # impl_cls always returns an AttentionImpl subclass
             num_heads,
             head_size,

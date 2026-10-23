@@ -33,6 +33,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor, xxhash, xxhash_cbor
+from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
@@ -3565,7 +3566,7 @@ def test_auto_fit_max_model_len():
     assert vllm_config.model_config.max_model_len > 0
 
 
-def test_auto_fit_max_model_len_with_hybrid():
+def test_auto_fit_max_model_len_with_hybrid(monkeypatch):
     """Test that auto-fit works with hybrid KV cache specs."""
     # Create config with original_max_model_len=-1 to trigger auto-fit
     model_config = ModelConfig(max_model_len=8192)
@@ -3574,16 +3575,27 @@ def test_auto_fit_max_model_len_with_hybrid():
     vllm_config = VllmConfig(model_config=model_config)
     vllm_config.cache_config.kv_cache_layout = "LBNHC"
 
-    mem_per_block_per_layer = 16 * 2 * 64 * 4 * 2  # 16KB per block per layer
+    monkeypatch.setenv("VLLM_SAMPLER_RESERVE_MIB", "1")
     gamma = 2
     kv_cache_specs = {
         "layer_1": new_mamba_spec(num_speculative_blocks=gamma),
         "layer_2": new_kv_cache_spec(),
     }
 
-    # One extra block on top of what a 1024-token request needs: the pool
-    # reserves one block as the null block.
-    available_memory = mem_per_block_per_layer * (1024 // 16 + 1 + gamma + 1)
+    # State pages are reserved per running request, independently of the
+    # attention pool whose usable token capacity drives auto-fit.
+    mamba_spec = kv_cache_specs["layer_1"]
+    mamba_blocks_per_req = cdiv(
+        mamba_spec.max_memory_usage_bytes(vllm_config), mamba_spec.page_size_bytes
+    )
+    mamba_bytes = (
+        vllm_config.scheduler_config.max_num_seqs * mamba_blocks_per_req + 1
+    ) * mamba_spec.page_size_bytes
+    available_memory = (
+        kv_cache_specs["layer_2"].page_size_bytes * (1024 // 16 + 1)
+        + mamba_bytes
+        + 1024**2
+    )
     _kv_cache_configs = get_kv_cache_configs(
         vllm_config, [kv_cache_specs], [available_memory]
     )
@@ -4111,10 +4123,16 @@ def _spec_decode_grouping_config(method="dspark", model_type=None):
     """Grouping config with an EAGLE-family speculative method enabled."""
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1, prefill_context_parallel_size=1
+        ),
+        attention_config=SimpleNamespace(hisparse_config=None),
+        kv_transfer_config=None,
         cache_config=SimpleNamespace(
+            mamba_cache_mode="all",
             get_resolved_kv_cache_layout=lambda: SimpleNamespace(
                 is_block_outermost=True
-            )
+            ),
         ),
         model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)),
         speculative_config=SimpleNamespace(
