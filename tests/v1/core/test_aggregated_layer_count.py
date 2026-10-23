@@ -113,7 +113,7 @@ def _make_specs(slot_bytes_per_layer, with_mamba):
     return specs, attn_spec
 
 
-def _config(max_model_len=1024):
+def _config(max_model_len=1024, layout="LBNHC"):
     model_config = ModelConfig(max_model_len=max_model_len)
     config = VllmConfig(
         model_config=model_config,
@@ -127,16 +127,18 @@ def _config(max_model_len=1024):
         ),
     )
     # Resolved by the engine core in a real boot; the planner reads it.
-    config.cache_config.kv_cache_layout = "LBNHC"
+    config.cache_config.kv_cache_layout = layout
     # The stand-in model config is not hybrid, so the post-init check turned
     # the hybrid manager off; the mamba arm models a hybrid model.
     config.scheduler_config.disable_hybrid_kv_cache_manager = False
     return config
 
 
-def _plan(slot_bytes_per_layer, with_mamba, available_memory):
+def _plan(slot_bytes_per_layer, with_mamba, available_memory, layout="LBNHC"):
     specs, attn_spec = _make_specs(slot_bytes_per_layer, with_mamba)
-    config = get_kv_cache_configs(_config(), [specs], [available_memory])[0]
+    config = get_kv_cache_configs(_config(layout=layout), [specs], [available_memory])[
+        0
+    ]
     attn_layers = {n for n, s in specs.items() if isinstance(s, FusedAttentionSpec)}
     attn_tensors = [
         t for t in config.kv_cache_tensors if attn_layers.intersection(t.layers)
@@ -170,10 +172,13 @@ def test_default_specs_declare_no_fusing():
 
 
 @pytest.mark.parametrize("with_mamba", [True, False])
-def test_fused_layers_alias_one_page(with_mamba):
+@pytest.mark.parametrize("layout", ["LBHNC", "LBNHC", "BLHNC", "BLNHC"])
+def test_fused_layers_alias_one_page(with_mamba, layout):
     """N fused layers view ONE page region, not one region each."""
     available = 2 * 1024**3
-    config, attn_spec, attn_tensors = _plan(MIXED_SLOT_BYTES, with_mamba, available)
+    config, attn_spec, attn_tensors = _plan(
+        MIXED_SLOT_BYTES, with_mamba, available, layout=layout
+    )
 
     assert attn_spec.aggregated_layer_count == len(MIXED_SLOT_BYTES)
     assert sorted(len(t.layers) for t in attn_tensors) == [1] * len(MIXED_SLOT_BYTES)
@@ -188,7 +193,8 @@ def test_fused_layers_alias_one_page(with_mamba):
 # page, so the unfused control pays that padding once per layer and the two arms
 # no longer cost equal bytes.
 @pytest.mark.parametrize("with_mamba", [False])
-def test_fused_capacity_matches_equal_byte_uniform_control(with_mamba):
+@pytest.mark.parametrize("layout", ["LBHNC", "LBNHC", "BLHNC", "BLNHC"])
+def test_fused_capacity_matches_equal_byte_uniform_control(with_mamba, layout):
     """The fused arm must report the capacity its bytes actually buy.
 
     The control is the uniform allocation the mixed one is meant to replace:
@@ -197,9 +203,9 @@ def test_fused_capacity_matches_equal_byte_uniform_control(with_mamba):
     so any difference in reported blocks is pure accounting.
     """
     available = 2 * 1024**3
-    mixed, mixed_spec, _ = _plan(MIXED_SLOT_BYTES, with_mamba, available)
+    mixed, mixed_spec, _ = _plan(MIXED_SLOT_BYTES, with_mamba, available, layout=layout)
     control, control_spec, control_tensors = _plan(
-        UNIFORM_SLOT_BYTES[:1], with_mamba, available
+        UNIFORM_SLOT_BYTES[:1], with_mamba, available, layout=layout
     )
 
     # Sanity: the control really is the unfused path.
@@ -217,10 +223,13 @@ def test_fused_capacity_matches_equal_byte_uniform_control(with_mamba):
 
 
 @pytest.mark.parametrize("with_mamba", [True, False])
-def test_budget_and_allocation_stay_in_lockstep(with_mamba):
+@pytest.mark.parametrize("layout", ["LBHNC", "LBNHC", "BLHNC", "BLNHC"])
+def test_budget_and_allocation_stay_in_lockstep(with_mamba, layout):
     """Never plan more blocks than the allocation can back."""
     available = 2 * 1024**3
-    config, attn_spec, attn_tensors = _plan(MIXED_SLOT_BYTES, with_mamba, available)
+    config, attn_spec, attn_tensors = _plan(
+        MIXED_SLOT_BYTES, with_mamba, available, layout=layout
+    )
 
     sizes = {t.size for t in config.kv_cache_tensors}
     assert len(sizes) == 1

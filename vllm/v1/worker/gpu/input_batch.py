@@ -137,7 +137,7 @@ class InputBatch:
 
         req_ids = [f"req_{i}_{random_uuid()}" for i in range(num_reqs)]
         idx_mapping_np = np.arange(num_reqs, dtype=np.intp)
-        idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=device)
+        idx_mapping = torch.arange(num_reqs, dtype=torch.int64, device=device)
         expanded_idx_mapping = idx_mapping
         expanded_local_pos = torch.zeros(num_reqs, dtype=torch.int32, device=device)
 
@@ -252,22 +252,21 @@ def set_dummy_context(
     input_batch.positions.copy_(torch.from_numpy(local_pos + context_len))
 
     seq_len = context_len + query_len
-    # One count for all groups, or each group's own pool (a separate mamba
-    # pool is far smaller than the main one).
+    # Each group may have its own pool size.
     if isinstance(num_kv_blocks, int):
         num_kv_blocks = [num_kv_blocks] * len(input_block_tables)
-    for block_table, block_size, bpk, group_num_blocks in zip(
-        input_block_tables,
-        block_tables.kernel_block_sizes,
-        block_tables.blocks_per_kv_block,
-        num_kv_blocks,
+    for block_table, block_size, group_num_blocks in zip(
+        input_block_tables, block_tables.block_sizes, num_kv_blocks
     ):
         num_blocks = min(cdiv(seq_len, block_size), block_table.shape[1])
-        # Spans are disjoint until the pool runs out, then they wrap and share
-        # blocks: profiling only needs the reads to be realistic, not distinct.
-        block_ids = torch.arange(
-            num_reqs * num_blocks, dtype=block_table.dtype, device=block_table.device
-        ) % (group_num_blocks * bpk)
+        block_ids = (
+            torch.arange(
+                num_reqs * num_blocks,
+                dtype=block_table.dtype,
+                device=block_table.device,
+            )
+            % group_num_blocks
+        )
         block_table[:num_reqs, :num_blocks] = block_ids.view(num_reqs, num_blocks)
 
 
@@ -719,7 +718,9 @@ def expand_idx_mapping(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_reqs = idx_mapping.shape[0]
     expanded_idx_mapping = idx_mapping.new_empty(total_num_logits)
-    expanded_local_pos = idx_mapping.new_empty(total_num_logits)
+    expanded_local_pos = torch.empty(
+        total_num_logits, dtype=torch.int32, device=idx_mapping.device
+    )
     _expand_idx_mapping_kernel[(num_reqs,)](
         idx_mapping,
         expanded_idx_mapping,

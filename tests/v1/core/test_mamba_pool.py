@@ -151,9 +151,12 @@ def test_pools_never_alias_and_fit_the_allocation():
             if t.layers[0] in g.layer_names
         )
         blocks = config.num_blocks_of(t)
-        end = t.offset + (len(t.layers) - 1) * t.layer_stride + (
-            blocks - 1
-        ) * t.block_stride + spec.page_size_bytes
+        end = (
+            t.offset
+            + (len(t.layers) - 1) * t.layer_stride
+            + (blocks - 1) * t.block_stride
+            + spec.page_size_bytes
+        )
         assert end <= size
         if t.num_blocks is None:
             main_end = max(main_end, end)
@@ -194,7 +197,9 @@ def _manager_config(num_blocks=64, mamba_blocks=5):
     )
     # "none" mode: the state block spans the whole sequence (upstream sets
     # mamba_block_size = max_model_len), one block per request per group.
-    mamba = MambaSpec(block_size=MAX_MODEL_LEN, shapes=((1, 1),), dtypes=(torch.float32,))
+    mamba = MambaSpec(
+        block_size=MAX_MODEL_LEN, shapes=((1, 1),), dtypes=(torch.float32,)
+    )
     return KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[],
@@ -347,7 +352,8 @@ def test_composite_attention_shares_one_dense_page_beside_the_state_pool():
     attention = [
         t
         for t in config.kv_cache_tensors
-        if t.num_blocks is None and t.layers[0] in {f"layer_{i}" for i in range(3, 24, 4)}
+        if t.num_blocks is None
+        and t.layers[0] in {f"layer_{i}" for i in range(3, 24, 4)}
     ]
 
     assert config.mamba_pool_num_blocks is not None

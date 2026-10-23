@@ -12,7 +12,7 @@ Turbo Attention plugin (`tkv`, `--kv-cache-dtype tkv`); the seam itself holds
 no TKV-specific knowledge beyond the `TURBO_ATTN` enum slot and the
 `_tq_layer_idx` injection.
 
-Base: upstream **v0.31.0**.
+Base: upstream **v0.32.0**.
 
 ---
 
