@@ -3184,6 +3184,7 @@ class VllmConfig:
         Runs once per model: configs derived for sub-models (`with_hf_config`)
         may pick a different runner, and must not revisit the decision.
         """
+        from vllm.config.cache import is_plugin_cache_dtype
         from vllm.platforms import current_platform
         from vllm.utils.vmm_driver import imex_channel_available
 
@@ -3200,6 +3201,14 @@ class VllmConfig:
         unsupported = None
         if not current_platform.is_cuda_alike():
             unsupported = "it is only supported on CUDA and ROCm"
+        elif is_plugin_cache_dtype(cache_config.cache_dtype):
+            unsupported = "plugin KV storage uses a fixed allocation"
+        elif (
+            requested is None
+            and self.model_config.is_hybrid
+            and cache_config.mamba_cache_mode != "all"
+        ):
+            unsupported = "the separate recurrent state pool requires fixed KV storage"
         elif cache_config.kv_cache_memory_bytes is not None:
             unsupported = (
                 "it sizes the KV cache from measured memory, which "

@@ -71,6 +71,8 @@ def _make_profiling_runner(
         encoder_runner=SimpleNamespace(has_cudagraph=lambda: encoder_only),
     )
 
+    runner.kv_caches = []
+
     events: list[str] = []
     runner.events = events
 
@@ -205,6 +207,31 @@ def test_profile_cudagraph_memory_piecewise_or_encoder_returns_measured(
     assert _FakePlatform._global_graph_pool == GLOBAL_POOL
 
 
+@pytest.mark.parametrize("kv_init_only", [False, True])
+def test_profile_cudagraph_memory_measures_kv_cache_init_apart(
+    monkeypatch, kv_init_only
+):
+    """Exclude shared KV storage once and account separately for init workspaces."""
+    _patch_module(monkeypatch)
+    mib = 1 << 20
+    kv_cache = torch.empty(3 * mib, dtype=torch.uint8)
+    free = iter([100 * mib, (100 - 3 - 7) * mib])
+    monkeypatch.setattr(
+        cgu.torch.accelerator, "get_memory_info", lambda: (next(free), 0)
+    )
+
+    def _init(r):
+        r.kv_caches = [kv_cache, kv_cache[:mib]]
+
+    monkeypatch.setattr(cgu, "_init_minimal_kv_cache_for_profiling", _init)
+    runner = _make_profiling_runner(CUDAGraphMode.FULL, captured_bytes=5 * mib)
+
+    assert cgu.profile_cudagraph_memory(runner, kv_init_only=kv_init_only) == (
+        0 if kv_init_only else 5 * mib
+    )
+    assert runner.kv_cache_init_memory == 7 * mib
+
+
 @pytest.mark.parametrize("encoder_only", [False, True])
 def test_profile_cudagraph_memory_tears_down_on_capture_error(
     monkeypatch, encoder_only
@@ -264,7 +291,9 @@ def test_model_runner_delegates_to_cudagraph_utils(monkeypatch, extensible):
     runner.eplb = EPLBController(
         SimpleNamespace(enable_eplb=False), torch.device("cpu")
     )
-    monkeypatch.setattr(mrv2, "_profile_cudagraph_memory", lambda r: 42)
+    monkeypatch.setattr(
+        mrv2, "_profile_cudagraph_memory", lambda r, *, kv_init_only: 42
+    )
     assert runner.profile_cudagraph_memory() == (0 if extensible else 42)
 
 

@@ -1096,7 +1096,9 @@ def get_max_concurrency_for_kv_cache_config(
     """
     num_blocks_per_request = 0
     host_blocks_per_request = 0
-    for group in kv_cache_config.kv_cache_groups:
+    for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+        if kv_cache_config.uses_mamba_pool(group_id):
+            continue
         required = cdiv(
             group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
             group.kv_cache_spec.page_size_bytes,

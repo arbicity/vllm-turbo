@@ -250,17 +250,36 @@ def run_mixed_prefill_decode_warmup(
         [block_count(prefill_len, s) for s in kv_cache_specs]
         for prefill_len in prefill_lens
     ]
-    required_blocks = sum(decode_block_counts) + sum(map(sum, prefill_block_counts))
+    kv_cache_config = model_runner.kv_cache_config
+    pool_of = [kv_cache_config.uses_mamba_pool(g) for g in range(len(kv_cache_specs))]
+
+    def pool_requirements():
+        return {
+            pool: sum(
+                decode_block_counts[g] + sum(row[g] for row in prefill_block_counts)
+                for g, p in enumerate(pool_of)
+                if p == pool
+            )
+            for pool in set(pool_of)
+        }
+
+    def fits():
+        return all(
+            n < (kv_cache_config.mamba_pool_num_blocks if pool else num_blocks)
+            for pool, n in pool_requirements().items()
+        )
+
     num_blocks = num_committable_kv_blocks(model_runner)
     # Drop extra prefill requests the committable blocks cannot hold.
-    while num_blocks <= required_blocks and len(prefill_lens) > 1:
+    while not fits() and len(prefill_lens) > 1:
         prefill_lens.pop()
-        required_blocks -= sum(prefill_block_counts.pop())
+        prefill_block_counts.pop()
     num_tokens = decode_scheduled_tokens + sum(prefill_lens)
     prefill_req_ids = [
         f"{req_id_prefix}_prefill_{i}_" for i in range(len(prefill_lens))
     ]
-    if num_blocks <= required_blocks:
+    required_blocks = pool_requirements().get(False, 0)
+    if not fits():
         logger.warning(
             "Skipping V2 mixed prefill+decode warmup because only %d KV blocks "
             "are available for %d required warmup blocks.",
@@ -270,12 +289,13 @@ def run_mixed_prefill_decode_warmup(
         return False
     ensure_kv_cache_blocks(model_runner, 1 + required_blocks)
 
-    next_block_id = 1
+    # Each pool numbers its blocks from 1 (0 is its null block).
+    next_block_id = dict.fromkeys(pool_of, 1)
 
-    def _alloc_blocks(num_blocks: int) -> list[int]:
-        nonlocal next_block_id
-        block_ids = list(range(next_block_id, next_block_id + num_blocks))
-        next_block_id += num_blocks
+    def _alloc_blocks(num_blocks: int, group_id: int) -> list[int]:
+        pool = pool_of[group_id]
+        block_ids = list(range(next_block_id[pool], next_block_id[pool] + num_blocks))
+        next_block_id[pool] += num_blocks
         return block_ids
 
     sampling_params = SamplingParams(
@@ -295,7 +315,9 @@ def run_mixed_prefill_decode_warmup(
             mm_features=[],
             sampling_params=sampling_params,
             pooling_params=None,
-            block_ids=tuple(_alloc_blocks(n) for n in decode_prefill_block_counts),
+            block_ids=tuple(
+                _alloc_blocks(n, g) for g, n in enumerate(decode_prefill_block_counts)
+            ),
             num_computed_tokens=0,
             lora_request=None,
             prefill_token_ids=decode_token_ids,
@@ -306,7 +328,9 @@ def run_mixed_prefill_decode_warmup(
     }
     decode_prefill_output.total_num_scheduled_tokens = decode_prompt_len
 
-    decode_new_blocks = tuple(_alloc_blocks(n) for n in decode_block_deltas)
+    decode_new_blocks = tuple(
+        _alloc_blocks(n, g) for g, n in enumerate(decode_block_deltas)
+    )
     cached_decode_req = CachedRequestData.make_empty()
     cached_decode_req.req_ids = [decode_req_id]
     cached_decode_req.num_computed_tokens = [decode_prompt_len]
@@ -344,7 +368,9 @@ def run_mixed_prefill_decode_warmup(
                 mm_features=[],
                 sampling_params=prefill_sampling_params,
                 pooling_params=None,
-                block_ids=tuple(_alloc_blocks(n) for n in block_counts),
+                block_ids=tuple(
+                    _alloc_blocks(n, g) for g, n in enumerate(block_counts)
+                ),
                 num_computed_tokens=0,
                 lora_request=None,
                 prefill_token_ids=prefill_token_ids,
@@ -626,6 +652,8 @@ def _warmup_kernels(
         model_runner.scheduler_config.max_num_seqs,
         max(prompt_len, decode_query_len),
     )
+    kv_cache_config = model_runner.kv_cache_config
+    pool_of = [kv_cache_config.uses_mamba_pool(g) for g in range(len(kv_cache_specs))]
     block_tables = getattr(model_runner, "block_tables", None)
     null_blocks = block_tables is not None and (
         block_tables.redirect_writes_to_null_block
@@ -633,10 +661,17 @@ def _warmup_kernels(
     if max_blocks_per_req > 0 and not null_blocks:
         # Reserve block 0 (null block) and ensure we have enough blocks.
         # Encoder-only models allocate no KV blocks, so this cap doesn't apply.
-        num_reqs = min(
-            num_reqs,
-            max(1, (num_committable_kv_blocks(model_runner) - 1) // max_blocks_per_req),
-        )
+        # Each pool caps the request count on its own groups' blocks.
+        for pool in set(pool_of):
+            group_ids = [g for g in range(len(pool_of)) if pool_of[g] == pool]
+            per_req = sum(decode_block_counts[g] for g in group_ids)
+            if per_req > 0:
+                available = (
+                    kv_cache_config.group_num_blocks(group_ids[0])
+                    if pool
+                    else num_committable_kv_blocks(model_runner)
+                )
+                num_reqs = min(num_reqs, max(1, (available - 1) // per_req))
         ensure_kv_cache_blocks(model_runner, 1 + num_reqs * max_blocks_per_req)
 
     req_ids = [f"_warmup_{i}_" for i in range(num_reqs)]
@@ -657,12 +692,15 @@ def _warmup_kernels(
         )
         pooling_params = None
 
-    # Assign distinct block IDs per request per group. 0 null block, start from 1.
-    next_block_id = 1
+    # Assign distinct block IDs per request per group. 0 null block, start from 1;
+    # each pool numbers its own blocks.
+    next_block_id = dict.fromkeys(pool_of, 1)
 
-    def _alloc_blocks(num_blocks: int) -> list[int]:
-        nonlocal next_block_id
-        return list(range(next_block_id, next_block_id := next_block_id + num_blocks))
+    def _alloc_blocks(num_blocks: int, group_id: int) -> list[int]:
+        pool = pool_of[group_id]
+        start = next_block_id[pool]
+        next_block_id[pool] = start + num_blocks
+        return list(range(start, start + num_blocks))
 
     # The KV-block zeroing kernel is driven by the scheduler's
     # new_block_ids_to_zero, so none of the steps below reach it.
@@ -679,7 +717,9 @@ def _warmup_kernels(
                 pooling_params,
                 mm_features=warmup_mm_features,
             ),
-            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+            block_ids=tuple(
+                _alloc_blocks(n, g) for g, n in enumerate(prefill_block_counts)
+            ),
             prefill_token_ids=prompt_token_ids,
         )
         for i in range(num_reqs)
@@ -737,7 +777,9 @@ def _warmup_kernels(
                     for spec, held in zip(kv_cache_specs, req_blocks[i])
                 ]
                 cached_req_data.new_block_ids.append(
-                    tuple(_alloc_blocks(n) for n in deltas) if any(deltas) else None
+                    tuple(_alloc_blocks(n, g) for g, n in enumerate(deltas))
+                    if any(deltas)
+                    else None
                 )
                 req_blocks[i] = [
                     held + delta for held, delta in zip(req_blocks[i], deltas)
