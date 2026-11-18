@@ -197,6 +197,7 @@ from vllm.v1.worker.utils import (
     clear_layer_kv_caches,
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
+    mamba_pool_layout,
 )
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
@@ -356,6 +357,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
         self.cudagraph_manager: ModelCudaGraphManager | None = None
+        # Measured by profile_cudagraph_memory() for the worker's accounting.
+        self.kv_cache_init_memory = 0
 
         # LoRA-related workers.
         self.lora_state = LoraState(max_num_reqs=self.max_num_reqs)
@@ -1118,14 +1121,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pooling_runner.release_late_interaction_query_cache(query_keys)
 
     @torch.inference_mode()
-    def profile_cudagraph_memory(self) -> int:
+    def profile_cudagraph_memory(self, *, kv_init_only: bool = False) -> int:
         """Estimate the GPU memory required to capture CUDA graphs."""
         if self.cache_config.enable_extensible_kv_cache:
             # The extensible KV cache measures the capture footprint after warmup.
             return 0
         # Runs before the KV cache exists, outside compile_or_warm_up_model.
         with self.eplb.suppress():
-            return _profile_cudagraph_memory(self)
+            return _profile_cudagraph_memory(self, kv_init_only=kv_init_only)
 
     def needs_cudagraph_capture(self) -> bool:
         """Whether capture_model() has any CUDA graphs left to capture."""
@@ -1371,6 +1374,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 [*self.kv_caches, *self.replayssm_block_copy_tensors],
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
+                mamba_pool=mamba_pool_layout(self.kv_cache_config),
             )
 
     def gather_batch_req_state(
@@ -1975,10 +1979,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch, valid_dummy_state_slots
                 )
                 if context_len:
+                    num_blocks: int | list[int]
                     if self.extensible_kv_cache is not None:
                         num_blocks = self.extensible_kv_cache.num_committed_blocks
                     else:
-                        num_blocks = self.kv_cache_config.num_blocks
+                        num_blocks = [
+                            self.kv_cache_config.group_num_blocks(g)
+                            for g in range(len(self.kv_cache_config.kv_cache_groups))
+                        ]
                     set_dummy_context(
                         input_batch,
                         self.block_tables,

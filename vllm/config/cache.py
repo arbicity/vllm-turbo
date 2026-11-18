@@ -41,6 +41,12 @@ def _layout_from_name(layout_name: str) -> KVCacheLayout:
         ) from None
 
 
+# Static type for every builtin dtype value; kept as a real Literal (not a
+# bare ``str``) so callers and IDEs get completion/checking for the common
+# case, and so ``cache_dtype_choices()`` has a source of truth for --help.
+#
+# CacheConfig accepts arbitrary strings and validates them against the two
+# registries after plugins have loaded.
 CacheDType = Literal[
     "auto",
     "float16",
@@ -65,6 +71,47 @@ CacheDType = Literal[
     "nvfp4",
     "nvfp4_4over6",
 ]
+# Plugin-registered dtypes added at runtime via register_cache_dtype().
+_PLUGIN_CACHE_DTYPES: set[str] = set()
+
+
+def register_cache_dtype(name: str, torch_dtype) -> None:
+    """Register a custom KV cache dtype contributed by a plugin.
+
+    After this call, ``--kv-cache-dtype <name>`` will be accepted by
+    argparse and the name will be mapped to ``torch_dtype`` in
+    STR_DTYPE_TO_TORCH_DTYPE.
+    """
+    from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+
+    _PLUGIN_CACHE_DTYPES.add(name)
+    STR_DTYPE_TO_TORCH_DTYPE[name] = torch_dtype
+
+
+def validate_cache_dtype(name: str) -> str:
+    """Argparse ``type=`` callable. Validates against builtins + plugins."""
+    allowed = set(KV_CACHE_DTYPES) | _PLUGIN_CACHE_DTYPES
+    if name not in allowed:
+        raise ValueError(
+            f"Unknown --kv-cache-dtype {name!r}. Allowed: {sorted(allowed)}"
+        )
+    return name
+
+
+def cache_dtype_choices() -> list[str]:
+    """All valid ``--kv-cache-dtype`` values: builtins plus anything
+    registered via ``register_cache_dtype()`` so far (parser-build time)."""
+    return sorted(set(KV_CACHE_DTYPES) | _PLUGIN_CACHE_DTYPES)
+
+
+def is_plugin_cache_dtype(name: str) -> bool:
+    """Return True if ``name`` was registered via ``register_cache_dtype``.
+
+    Used by arg post-processing to auto-default ``--attention-backend`` to
+    ``TURBO_ATTN`` when the user selects a plugin-registered KV cache dtype.
+    """
+    return name in _PLUGIN_CACHE_DTYPES
+
 
 # Mutable mirror of the CacheDType Literal. Custom dtypes registered by
 # platform backends are appended here at registration time. Never snapshot
@@ -169,7 +216,7 @@ def get_kv_cache_dtype_handler(name: str) -> KVCacheDTypeHandler | None:
 
 def is_known_kv_cache_dtype(name: str) -> bool:
     """Whether ``name`` is a valid ``--kv-cache-dtype`` value."""
-    return name in KV_CACHE_DTYPES
+    return name in KV_CACHE_DTYPES or name in _PLUGIN_CACHE_DTYPES
 
 
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]

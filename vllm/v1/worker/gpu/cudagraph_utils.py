@@ -986,13 +986,17 @@ _MIN_PER_GRAPH_BYTES = 1 << 20
 
 
 @torch.inference_mode()
-def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
+def profile_cudagraph_memory(
+    runner: "GPUModelRunner", *, kv_init_only: bool = False
+) -> int:
     """Estimate the GPU memory needed for CUDA graph capture.
 
     Called during memory profiling, *before* the real KV cache is allocated,
     so that ``Worker.determine_available_memory`` can reserve headroom for
     graph capture. Bootstraps a minimal KV cache, runs ``capture_model()``
     once, then releases everything so the real init/capture path starts clean.
+    With kv_init_only, record the KV initialization workspace and release
+    the profiling cache before any graph capture.
 
     FULL graphs bake in KV cache pointers, so only the largest few are
     captured (into a throwaway pool) and their total cost is extrapolated.
@@ -1026,8 +1030,23 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     platform_cls._global_graph_pool = throwaway_pool
 
     try:
+        free_before_init = torch.accelerator.get_memory_info()[0]
         with set_current_vllm_config(runner.vllm_config):
             _init_minimal_kv_cache_for_profiling(runner)
+        # The real KV cache init re-creates what this one allocated beside the
+        # KV cache (e.g. attention workspaces) after the KV cache is sized, so
+        # the worker counts it as consumed. Shared layers reuse one storage.
+        torch.accelerator.empty_cache()
+        kv_cache_storages = {
+            cache.untyped_storage().data_ptr(): cache.untyped_storage().nbytes()
+            for cache in runner.kv_caches
+        }
+        runner.kv_cache_init_memory = max(
+            free_before_init
+            - torch.accelerator.get_memory_info()[0]
+            - sum(kv_cache_storages.values()),
+            0,
+        )
 
         manager = runner.cudagraph_manager
         assert manager is not None
@@ -1040,7 +1059,7 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         speculator = runner.speculator
         spec_manager_names: list[str] = []
         try:
-            if not runner.needs_cudagraph_capture():
+            if kv_init_only or not runner.needs_cudagraph_capture():
                 return 0
             manager.pool = throwaway_pool
             if manager.use_breakable_cg:

@@ -78,6 +78,7 @@ from vllm.config.cache import (
     MambaCacheMode,
     MambaDType,
     PrefixCachingHashAlgo,
+    is_plugin_cache_dtype,
 )
 from vllm.config.device import Device
 from vllm.config.kernel import (
@@ -1413,7 +1414,14 @@ class EngineArgs:
             "--enable-extensible-kv-cache",
             **cache_kwargs["enable_extensible_kv_cache"],
         )
-        cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
+        # Include registered plugin dtypes in CLI choices and error messages.
+        from vllm.config.cache import cache_dtype_choices as _cache_dtype_choices
+        from vllm.config.cache import validate_cache_dtype as _validate_cdt
+
+        _kv_kwargs = cache_kwargs["cache_dtype"]
+        _kv_kwargs["choices"] = _cache_dtype_choices()
+        _kv_kwargs["type"] = _validate_cdt
+        cache_group.add_argument("--kv-cache-dtype", **_kv_kwargs)
         cache_group.add_argument(
             "--num-gpu-blocks-override", **cache_kwargs["num_gpu_blocks_override"]
         )
@@ -2784,6 +2792,26 @@ class EngineArgs:
             logger.info(
                 "VLLM_BATCH_INVARIANT is enabled and no attention backend was "
                 "specified; defaulting to TRITON_ATTN."
+            )
+
+        # Plugin-registered KV cache dtypes (e.g. tkv) ship their own
+        # AttentionBackend, registered under AttentionBackendEnum.TURBO_ATTN
+        # via register_backend(). When the user selects such a dtype without
+        # --attention-backend, default to TURBO_ATTN: the platform would pick
+        # it anyway, but only a NAMED backend reaches the lifecycle hooks the
+        # worker dispatches before its attention groups exist
+        # (gpu_worker._backends_in_use -> on_model_loaded, adjust_kv_budget;
+        # kv_cache_manager -> on_kv_manager_created). An explicit choice
+        # (--attention-backend or --attention-config.backend) is honoured.
+        if attention_config.backend is None and is_plugin_cache_dtype(
+            resolved_cache_dtype
+        ):
+            attention_config.backend = AttentionBackendEnum.TURBO_ATTN
+            logger.info(
+                "Auto-selecting attention backend TURBO_ATTN for "
+                "plugin-registered kv-cache dtype %r. Pass "
+                "--attention-backend to override.",
+                resolved_cache_dtype,
             )
 
         # TurboQuant requires FlashAttention 2 — FA3 boundary layers assert
