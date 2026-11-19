@@ -1669,7 +1669,10 @@ def test_auto_fit_max_model_len_with_hybrid(monkeypatch):
     model_config = ModelConfig(max_model_len=8192)
     # Simulate the user passing -1 by setting original_max_model_len
     model_config.original_max_model_len = -1
-    vllm_config = VllmConfig(model_config=model_config)
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        cache_config=CacheConfig(enable_extensible_kv_cache=False),
+    )
     vllm_config.cache_config.kv_cache_layout = "LBNHC"
 
     monkeypatch.setenv("VLLM_SAMPLER_RESERVE_MIB", "1")
@@ -2347,7 +2350,9 @@ def test_finalize_extensible_kv_cache_auto_max_model_len_warns_when_short(
     )
     model_config = ModelConfig(max_model_len=spec.block_size * 16)
     model_config.original_max_model_len = -1
-    vllm_config = VllmConfig(model_config=model_config)
+    vllm_config = VllmConfig(
+        model_config=model_config, cache_config=CacheConfig(gpu_memory_utilization=0.9)
+    )
     vllm_config.cache_config.kv_cache_layout = "LBNHC"
     groups = [KVCacheGroupSpec(["layer.0", "layer.1"], spec)]
     config = kv_cache_planning.get_kv_cache_config_from_groups(

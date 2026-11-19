@@ -16,7 +16,13 @@ import pytest
 import torch
 
 from tests.v1.core.utils import get_kv_cache_configs
-from vllm.config import DeviceConfig, ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import (
+    CacheConfig,
+    DeviceConfig,
+    ModelConfig,
+    SchedulerConfig,
+    VllmConfig,
+)
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
@@ -76,6 +82,7 @@ def _config(max_model_len=4096):
     config = VllmConfig(
         model_config=model_config,
         device_config=DeviceConfig(device="cpu"),
+        cache_config=CacheConfig(enable_extensible_kv_cache=False),
         scheduler_config=SchedulerConfig(
             max_num_batched_tokens=max_model_len,
             max_num_seqs=MAX_NUM_SEQS,
