@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A spec may fuse several layers into one shared KV page.
 
 `KVCacheSpec.aggregated_layer_count` is how a spec declares that its
@@ -23,13 +24,13 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from tests.v1.core.utils import get_kv_cache_configs
 from vllm.config import (
     DeviceConfig,
     ModelConfig,
     SchedulerConfig,
     VllmConfig,
 )
-from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,

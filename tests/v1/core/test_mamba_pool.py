@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A hybrid model's O(1) state layers draw from their own block pool.
 
 Mamba/GDN layers hold a fixed number of blocks per running request, never one
@@ -14,12 +15,13 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from tests.v1.core.utils import get_kv_cache_configs
 from vllm.config import DeviceConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
     KVCacheBlockCopy,
-    get_kv_cache_configs,
     get_request_block_hasher,
     init_none_hash,
 )
@@ -169,19 +171,24 @@ def test_pools_never_alias_and_fit_the_allocation():
 
 @pytest.mark.parametrize(
     "feature",
-    ["kv_transfer_config", "decode_context_parallel_size", "mamba_cache_mode_all"],
+    [
+        "kv_transfer_config",
+        "decode_context_parallel_size",
+        "pipeline_parallel_size",
+        "mamba_cache_mode_all",
+    ],
 )
 def test_shared_pool_kept_where_ids_cross_groups(feature):
     """Features that address blocks across groups by one id space keep the
     shared pool."""
-    from vllm.v1.core.kv_cache_utils import _mamba_pool_eligible
+    from vllm.v1.core.kv_cache_planning import _mamba_pool_eligible
 
     vllm_config = _config()
     specs = list(_specs().values())
     assert _mamba_pool_eligible(vllm_config, specs)
     if feature == "kv_transfer_config":
         object.__setattr__(vllm_config, "kv_transfer_config", object())
-    elif feature == "decode_context_parallel_size":
+    elif feature in {"decode_context_parallel_size", "pipeline_parallel_size"}:
         object.__setattr__(vllm_config.parallel_config, feature, 2)
     else:
         vllm_config.cache_config.mamba_cache_mode = "all"
@@ -252,8 +259,28 @@ def test_state_groups_allocate_from_their_own_pool():
     assert blocks is not None
     attn_blocks, a_blocks, b_blocks = blocks.blocks
     assert len(attn_blocks) == 3
-    assert all(b.pool is coordinator.block_pool for b in attn_blocks)
-    assert all(b.pool is coordinator.mamba_block_pool for b in a_blocks + b_blocks)
+    assert all(
+        b.pool is not None and b.pool() is coordinator.block_pool for b in attn_blocks
+    )
+    assert all(
+        b.pool is not None and b.pool() is coordinator.mamba_block_pool
+        for b in a_blocks + b_blocks
+    )
+
+
+def test_copy_block_ids_identify_the_managers_pool():
+    manager = _manager(_manager_config())
+    attention, state, _ = manager.coordinator.single_type_managers
+    expected = []
+    retained: list[KVCacheBlock] = []
+    for mgr, offset in ((attention, 0), (state, manager.kv_cache_config.num_blocks)):
+        src, dst = mgr.block_pool.get_new_blocks(2)
+        mgr._pending_cow_copies.append((src, dst))
+        expected.append(KVCacheBlockCopy(src.block_id + offset, dst.block_id + offset))
+        retained.extend((src, dst))
+
+    assert manager.take_kv_cache_block_copies() == (expected, retained)
+    assert manager.take_kv_cache_block_copies() == ([], [])
 
 
 def test_admission_checks_each_pool_against_its_own_blocks():

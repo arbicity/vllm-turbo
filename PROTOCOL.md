@@ -12,17 +12,17 @@ Turbo Attention plugin (`tkv`, `--kv-cache-dtype tkv`); the seam itself holds
 no TKV-specific knowledge beyond the `TURBO_ATTN` enum slot and the
 `_tq_layer_idx` injection.
 
-Base: upstream **v0.32.0**.
+Base: upstream **v0.34.0**.
 
 ---
 
 ## What upstream already provides (and the plugin uses directly)
 
 | Need | Upstream extension point |
-|---|---|
+| --- | --- |
 | Register the backend class | `register_backend(AttentionBackendEnum.TURBO_ATTN, ...)` |
 | Load the plugin in every process | `vllm.general_plugins` entry point |
-| Pack the KV page (one head slot of the codec's slot bytes) | `AttentionBackend.customize_spec`, applied by both model runners to every layer's spec and by the hybrid block-size alignment |
+| Pack the KV page (one head slot of the codec's slot bytes) | `AttentionBackend.customize_spec`, applied by the model runner to every layer's spec and by the hybrid block-size alignment |
 | Page geometry the allocator reads | `AttentionSpec.num_heads` / `state_content_size_bytes` (`[B, H, N, C]` views, vllm#51718) |
 | KV layout the kernels consume | `AttentionBackend.supported_kv_cache_layouts` |
 | Single-type manager for a custom spec | `KVCacheSpecRegistry` (MRO lookup: a `FullAttentionSpec` subclass gets the full-attention manager) |
@@ -32,11 +32,10 @@ Base: upstream **v0.32.0**.
 ### Plugin KV-cache dtypes — `vllm/config/cache.py`
 
 `register_cache_dtype(name, torch_dtype)`, `validate_cache_dtype`,
-`cache_dtype_choices`, `is_plugin_cache_dtype`. `CacheConfig.cache_dtype` is
-typed `str` and gated by the runtime validator: pydantic compiles a `Literal`
-annotation into the class validator at class-creation time, before any plugin
-has registered, so a `Literal` field makes every plugin dtype
-unconstructible. `CacheDType` survives as the static alias for the builtins.
+`cache_dtype_choices`, `is_plugin_cache_dtype`. Upstream accepts
+`CacheDType | str` and validates the name at runtime. The fork also
+recognizes dtypes registered by Turbo plugins and selects its backend for
+those dtypes when the user leaves the attention backend unset.
 
 Consumers: `--kv-cache-dtype` choices/type (`engine/arg_utils.py`) and the
 dtype assertion in `get_attn_backend` (`v1/attention/selector.py`).
@@ -61,7 +60,7 @@ back to the user-selected one before the groups exist), in order, and aborts
 on the first that raises (`_call_backend_hook`).
 
 | Hook | Called from | Used for |
-|---|---|---|
+| --- | --- | --- |
 | `on_model_loaded(worker, model)` | `Worker.load_model` | pre-flight checks, one-time o_proj fold, memory booking before profiling |
 | `on_draft_model_loaded(worker, draft_model)` | `Worker.load_model`, when a model-based drafter exists | fold the drafter's own layers |
 | `adjust_kv_budget(profiled_bytes, vllm_config)` | `Worker.determine_available_memory` | replace a non-positive profiled budget |
@@ -92,7 +91,7 @@ For `kv_cache_dtype == "tkv"`, `Attention.__init__` passes the layer ordinal
 from the prefix as `_tq_layer_idx` so the impl resolves its per-layer bit
 widths before the slot layout is frozen.
 
-### Fused pages — `vllm/v1/kv_cache_interface.py`, `vllm/v1/core/kv_cache_utils.py`
+### Fused pages — `vllm/v1/kv_cache_interface.py`, `vllm/v1/core/kv_cache_planning.py`
 
 `KVCacheSpec.aggregated_layer_count` (default 1). A spec whose
 `page_size_bytes` already sums N layers' per-layer pages (the TKV composite
@@ -111,10 +110,10 @@ the KV budget on state no request can use (Qwen3.5-0.8B at 10 GB: 5,728
 tokens shared vs 355,696 split; turbo-attn ATTRIBUTION §7.3).
 
 The seam gives those groups their own pool when it is safe to
-(`_mamba_pool_eligible`: Mamba cache mode `none`/`align`, no HiSparse, no KV
+(`_mamba_pool_eligible`: fixed allocation, Mamba cache mode `none`/`align`, no HiSparse, no KV
 connector, no context parallelism, no hidden-state layers):
 
-- **Planning** (`kv_cache_utils.py`): the recurrent pages are not unified
+- **Planning** (`kv_cache_planning.py`): the recurrent pages are not unified
   with attention (attention layers are unified among themselves); the state
   pool is sized `max_num_seqs * sum(per-request blocks per group) + 1` and,
   with a sampler-warmup reserve (`VLLM_SAMPLER_RESERVE_MIB`), comes off the

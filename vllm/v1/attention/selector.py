@@ -7,7 +7,11 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 import torch
 
 import vllm.envs as envs
-from vllm.config.cache import CacheDType
+from vllm.config.cache import (
+    KV_CACHE_DTYPES,
+    CacheDType,
+    is_known_kv_cache_dtype,
+)
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
@@ -120,11 +124,10 @@ def get_attn_backend(
 ) -> type[AttentionBackend]:
     """Selects which attention backend to use and lazily imports it."""
     if kv_cache_dtype is not None:
-        from vllm.config.cache import validate_cache_dtype
-
-        # Raises ValueError with a clear message if the dtype isn't
-        # builtin or plugin-registered.
-        validate_cache_dtype(kv_cache_dtype)
+        assert is_known_kv_cache_dtype(kv_cache_dtype), (
+            f"Invalid kv_cache_dtype: {kv_cache_dtype}. "
+            f"Valid values are: {KV_CACHE_DTYPES}"
+        )
 
     from vllm.config import get_current_vllm_config
 
@@ -296,20 +299,11 @@ def _cached_get_attn_backend(
         # Fall through to standard MLA selection without the user's
         # backend constraint AND with dtype gate lifted (kv_cache_dtype=
         # "auto"). The wrapper class will be applied below.
-        relaxed_config = attn_selector_config._replace(
-            kv_cache_dtype=cast(CacheDType | None, "auto"),
-        )
-        attention_cls = current_platform.get_attn_backend_cls(
-            None,
-            attn_selector_config=relaxed_config,
-            num_heads=num_heads,
-        )
-    else:
-        attention_cls = current_platform.get_attn_backend_cls(
-            backend,
-            attn_selector_config=attn_selector_config,
-            num_heads=num_heads,
-        )
+        backend = None
+        attn_selector_config = attn_selector_config._replace(kv_cache_dtype="auto")
+    attention_cls = current_platform.get_attn_backend_cls(
+        backend, attn_selector_config=attn_selector_config, num_heads=num_heads
+    )
     if not attention_cls:
         raise ValueError(
             f"Invalid attention backend for {current_platform.device_name}"
